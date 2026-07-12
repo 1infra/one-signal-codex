@@ -8,146 +8,197 @@ destination, same wire format, same One Connector access-token transport —
 different source, because Codex's session data model is unrelated to
 Claude Code's transcript format.
 
+Install it the same way you install our Claude Code plugin: through the
+tool's own plugin marketplace, no repo checkout required.
+
+## What it does
+
+After each Codex turn, Codex fires the plugin's `Stop` hook, which reads the
+session's rollout transcript and uploads it to your One Infra org (via One
+Connector) as a Langfuse trace: one root span per turn (`Codex CLI - Turn
+N`), one generation per model round-trip (with token usage/cost), tool-call
+spans nested under their generation, and reasoning captured as a lightweight
+event (never the encrypted content blob — only its optional plaintext
+summary). Traces from Codex CLI and Claude Code render in the same **Console
+→ Observe** UI with the same shape.
+
 ## Install
+
+```bash
+codex plugin marketplace add 1infra/1Infra
+codex plugin add one-signal-codex@one-infra
+mkdir -p ~/.codex && printf '{"ONE_SIGNAL_API_TOKEN":"oc_xxx"}' > ~/.codex/one-signal.json && chmod 600 ~/.codex/one-signal.json
+```
+
+Replace `oc_xxx` with your One Connector access token. That's it — start a
+new `codex` session (or run `codex exec "..."`) and your turns show up in
+**Console → Observe**.
+
+- **Line 1** registers this repo as a Codex plugin marketplace (Codex reads
+  `.agents/plugins/marketplace.json` at the repo root; this coexists with the
+  Claude Code marketplace at `.claude-plugin/marketplace.json`).
+- **Line 2** installs and enables the plugin. It writes
+  `[plugins."one-signal-codex@one-infra"] enabled = true` to
+  `~/.codex/config.toml` for you. The plugin's Stop hook runs under Codex's
+  **stable `hooks` feature** — on Codex 0.144.1 no extra feature flag is
+  needed (the old `plugin_hooks` flag is removed; see
+  [Requirements](#requirements) for older builds).
+- **Line 3** stores your token where the hook reads it (chmod 600). You can
+  use an environment variable instead — see [Configure](#configure).
+
+### Getting a token
+
+Console → **Access tokens** → create a new token (`oc_...`), named something
+you'll recognize (e.g. "laptop — Codex CLI"). The token-created dialog and
+the **Observe** onboarding card both show this exact install block with your
+token pre-filled.
+
+### Upgrading / uninstalling
+
+```bash
+codex plugin marketplace upgrade one-infra        # refresh the snapshot
+codex plugin remove one-signal-codex@one-infra    # remove the plugin
+```
+
+## Configure
+
+The hook resolves config at run time in this order: **environment variables
+first, then `~/.codex/one-signal.json`.**
+
+| Setting | Env var | JSON key | Description |
+| --- | --- | --- | --- |
+| API token | `ONE_SIGNAL_API_TOKEN` | `ONE_SIGNAL_API_TOKEN` | Your One Connector access token (`oc_...`). Required. |
+| Base URL | `ONE_SIGNAL_BASE_URL` | `ONE_SIGNAL_BASE_URL` | Your One Connector deployment. Default `https://connector.1infra.io`. The hook POSTs to `<this>/api/v1/observe/ingest`. |
+| User ID | `ONE_SIGNAL_USER_ID` | `ONE_SIGNAL_USER_ID` | Optional. User identifier attached to every trace. |
+| Debug logging | `ONE_SIGNAL_CODEX_DEBUG=1` | — | Verbose logging to `~/.codex/one-signal-hook.log`. |
+| Truncation | `ONE_SIGNAL_CODEX_MAX_CHARS` | — | Truncate captured inputs/outputs to this many characters. Default `20000`. |
+
+Env vars override the file, so you can keep the token in the file and
+override the base URL per shell (or vice versa). `CODEX_HOME` is respected
+everywhere — state, log, and config file all move under it if you've set it.
+
+Environment-variable alternative to the JSON file:
+
+```bash
+export ONE_SIGNAL_API_TOKEN="oc_xxx"   # add to ~/.zshrc / ~/.bashrc to persist
+```
+
+## Requirements
+
+- **Codex CLI ≥ 0.128** — plugin hooks were introduced here. Verified end to
+  end against **`codex-cli 0.144.1`**, where the `hooks` feature is stable and
+  enabled by default, so no feature flag is required. Check yours with
+  `codex --version` and `codex features list` (look for `hooks … stable …
+  true`).
+- **Older builds** where `hooks` isn't stable/default-on may need plugin
+  hooks explicitly enabled in `~/.codex/config.toml`:
+
+  ```toml
+  [features]
+  hooks = true          # or, on those builds, plugin_hooks = true
+  ```
+
+  On 0.144.1 the `plugin_hooks` flag is **removed** and setting it is a no-op
+  (the Stop hook fires even with `plugin_hooks=false`).
+- **Python 3.10+** as `python3` on your `PATH` (the Stop hook is a `python3`
+  command). No third-party packages — pure standard library.
+
+## Manual install (alternative)
+
+If you have this repo checked out and would rather use the legacy `notify`
+wiring instead of the plugin marketplace:
 
 ```bash
 python3 plugins/one-signal-codex/install.py --token oc_xxx
 ```
 
 This writes `~/.codex/one-signal.json` (chmod 600) and adds a `notify`
-entry to `~/.codex/config.toml` pointing at the hook script. Restart any
-running `codex` session (or just start a new one) to pick it up.
+entry to `~/.codex/config.toml` pointing at the hook script.
 
 | Flag | Description |
 | --- | --- |
 | `--token` | Your One Connector access token (`oc_...`). Required. |
-| `--base-url` | Your One Connector deployment URL. Default `https://connector.1infra.io`. The hook POSTs to `<this>/api/v1/observe/ingest`. |
+| `--base-url` | Your One Connector deployment URL. Default `https://connector.1infra.io`. |
 | `--user-id` | Optional. User identifier attached to every trace. |
-| `--uninstall` | Removes the `notify` wiring from `config.toml`. Leaves `one-signal.json` in place (delete it manually if you also want the token gone). |
+| `--uninstall` | Removes the `notify` wiring from `config.toml`. Leaves `one-signal.json` in place. |
 
-If `config.toml` already has a **different** `notify` command configured,
-the installer refuses to overwrite it (Codex only runs one notify command)
-and prints instructions for chaining both via a small wrapper script.
-
-### Getting a token
-
-Same as the Claude Code plugin: Console → **Access tokens** → create a new
-token (`oc_...`), named something you'll recognize (e.g. "laptop — Codex
-CLI").
-
-## Config reference
-
-Resolved in this order at hook-run time: environment variables first, then
-`~/.codex/one-signal.json`.
-
-| Setting | Env var | Description |
-| --- | --- | --- |
-| Base URL | `ONE_SIGNAL_BASE_URL` | Default `https://connector.1infra.io`. |
-| API token | `ONE_SIGNAL_API_TOKEN` | Your One Connector access token. |
-| User ID | `ONE_SIGNAL_USER_ID` | Optional, attached to every trace. |
-| Debug logging | `ONE_SIGNAL_CODEX_DEBUG=1` | Verbose logging to `~/.codex/one-signal-hook.log`. |
-| Truncation | `ONE_SIGNAL_CODEX_MAX_CHARS` | Truncate captured inputs/outputs to this many characters. Default `20000`. |
-
-`CODEX_HOME` is respected everywhere (state, log, and config file all move
-under it if you've set it).
-
-## Requirements
-
-Python 3.10+ as `python3`. No third-party packages — pure standard
-library, same as the Claude Code plugin.
+Codex only runs **one** `notify` command, so if `config.toml` already has a
+different `notify` configured (e.g. another integration), the installer
+refuses to overwrite it and prints wrapper-chaining instructions. **The
+marketplace path above has no such conflict** — plugin Stop hooks don't
+compete for the single `notify` slot, which is the main reason to prefer it.
 
 ## How it works
 
-Codex CLI's `notify` config spawns a program **once per completed agent
-turn**, passing it a single JSON argv (`{"type": "agent-turn-complete",
-"thread-id": ..., "turn-id": ..., "last-assistant-message": ...}` — see the
-top of `one_signal_codex_hook.py` for the exact verified shape). This
-payload is a thin trigger; it has no rollout path and no token-usage/tool
-detail. The hook uses it to resolve `thread-id` to a session rollout file
-under `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<thread-id>.jsonl`, then
-parses that file incrementally (tracking a byte-offset cursor so re-runs
-only process new turns) and builds one Langfuse trace per completed turn:
-a root span ("Turn N"), one generation per model round-trip (with token
-usage when available), tool-call spans nested under their generation, and
-reasoning captured as a lightweight event (never the encrypted content
-blob, only its optional plaintext summary). The batch is POSTed to
+The plugin's `Stop` hook (`hooks/hooks.json`) runs
+`python3 <plugin cache>/one_signal_codex_hook.py` after every turn. Codex
+pipes a JSON payload to the hook's **stdin** carrying `session_id` and
+`transcript_path` (the rollout file). The hook parses that rollout JSONL
+incrementally (tracking a byte-offset cursor so re-runs only process new
+turns) and builds one Langfuse trace per completed turn: a root span
+("Turn N"), one generation per model round-trip (with token usage when
+available), tool-call spans nested under their generation, and reasoning
+captured as a lightweight event. The batch is POSTed to
 `<ONE_SIGNAL_BASE_URL>/api/v1/observe/ingest`, identically to the Claude
-Code plugin — traces from both tools render in the same Traces UI with the
-same shape.
+Code plugin.
 
-State (byte offset + turn count per session, plus a thread-id → rollout-path
-cache) lives in `~/.codex/one-signal-state/state.json`, mirroring
-`~/.claude/state/one_signal_state.json` for the Claude plugin.
-
-## Known limitation: TUI vs. headless `codex exec`
-
-The commonly stated assumption is that `notify` only fires in the
-interactive TUI and never in headless `codex exec`. **On the Codex CLI
-version this was built and verified against (`codex-cli 0.144.1`), that
-turned out not to be true**: `codex exec` fired `notify` identically to the
-TUI (with `client: "codex_exec"` instead of `"codex-tui"` in the payload),
-confirmed with a live, non-interactive smoke test, and the Rust call site
-(`run_legacy_after_agent_hook` in `codex-rs/core/src/session/turn.rs`) is
-unconditional in the turn loop shared by both surfaces.
-
-This may differ on other CLI versions/builds — if your `codex exec` runs
-aren't showing up in Console → Observe, set `ONE_SIGNAL_CODEX_DEBUG=1` and
-check `~/.codex/one-signal-hook.log` for whether the hook was invoked at
-all versus invoked-but-failed.
-
-What genuinely does **not** reach this hook: any Codex surface that never
-fires `notify` — e.g. `codex mcp-server` / `app-server` embedding modes
-driven by an external harness that bypasses the CLI's own notify wiring,
-or another tool already occupying the single `notify` slot (see the
-installer's refusal behavior above).
+The same hook script also accepts the legacy `notify` argv payload (thread
+id, no transcript path — it globs `sessions/**/*-<thread-id>.jsonl`), and
+falls back to the newest rollout on disk if a payload variant carries
+neither. State (byte offset + turn count per session) lives under
+`${CODEX_HOME:-~/.codex}/one-signal-state/state.json`.
 
 ## Reliability notes
 
-- Same incremental-checkpoint discipline as the Claude plugin: the
-  byte-offset cursor only advances past turns whose events were fully
-  accepted upstream (every HTTP chunk 2xx, and any 207 response's
-  per-event `errors` empty) *and* that were completely parsed (a turn with
-  no `task_complete` seen yet is left for the next run). Deterministic
+- **Incremental checkpoint:** the byte-offset cursor only advances past
+  turns whose events were fully accepted upstream (every HTTP chunk 2xx, any
+  207's per-event `errors` empty) *and* that were completely parsed (a turn
+  with no `task_complete` seen yet is left for the next run). Deterministic
   trace/observation IDs (`<thread_id>-t<turn_number>`) make retries
   idempotent upserts, not duplicates.
-- The state-file lock (`~/.codex/one-signal-state/state.lock`) is a single
-  global lock shared by every Codex session on the machine, same
-  known-deferred trade-off as the Claude plugin.
+- **Stop-hook flush timing / self-heal:** the `Stop` hook can fire a beat
+  before Codex has fully flushed the just-finished turn to the rollout (the
+  `task_complete` marker isn't there yet). When that happens the hook finds
+  no complete turn and exits cleanly without advancing the checkpoint, so the
+  turn is picked up by the **next** Stop hook of the same session — verified
+  live: turn 1 uploaded on turn 2's Stop hook. Multi-turn sessions therefore
+  self-heal; a session's final turn uploads on its next Stop fire (e.g. when
+  resumed).
+- If your organization hasn't connected Langfuse yet, the proxy responds
+  `503 signal_not_configured`; the hook logs a hint and exits cleanly
+  without advancing the checkpoint, so it retries automatically once Langfuse
+  is connected.
 - `fcntl`-based locking doesn't exist on Windows; the hook proceeds without
   cross-process locking there (best-effort only).
-- Rollout-file discovery globs `~/.codex/sessions/**/*-<thread-id>.jsonl`
-  the first time a given session is seen, then caches the resolved path —
-  subsequent turns of a long session are O(1), not a repeated filesystem
-  walk.
-- If your organization hasn't connected Langfuse yet, the proxy responds
-  `503 signal_not_configured`; the hook logs a hint to the debug log and
-  exits cleanly without advancing the checkpoint, so it retries
-  automatically once Langfuse is connected.
 
 ## Privacy
 
-Same data-handling posture as the Claude Code plugin: this sends your
-Codex CLI turn data (prompts, assistant output, tool calls, token usage) to
-`ONE_SIGNAL_BASE_URL`, authenticated with your One Connector access token,
-which forwards it into your organization's own Langfuse project. Reasoning
-items' encrypted content blob (`encrypted_content`) is never read or
-transmitted — only the optional plaintext summary (present only if your
-Codex reasoning-summary setting is enabled) is captured, truncated the same
-way as everything else.
+This sends your Codex CLI turn data (prompts, assistant output, tool calls,
+token usage) to `ONE_SIGNAL_BASE_URL`, authenticated with your One Connector
+access token, which forwards it into your organization's own Langfuse
+project. Reasoning items' encrypted content blob (`encrypted_content`) is
+never read or transmitted — only the optional plaintext summary (present only
+if your Codex reasoning-summary setting is enabled) is captured, truncated
+via `ONE_SIGNAL_CODEX_MAX_CHARS`.
 
 ## Troubleshooting
 
-- Nothing showing up in Console → Observe: set `ONE_SIGNAL_CODEX_DEBUG=1`,
-  run a Codex turn, then check `~/.codex/one-signal-hook.log`.
-- `503 signal_not_configured` in the log: your organization hasn't
-  connected Langfuse yet — do that in Console → Integrations.
-- Hook not firing at all: check `notify` in `~/.codex/config.toml` points
-  at `one_signal_codex_hook.py`; re-run `install.py` if not.
-- `codex features list` can confirm which Codex features (e.g.
-  `unified_exec`) are active in your build — this affects tool names
-  (`exec_command` vs. `shell`) but not the hook's parsing, which handles
-  both `function_call`/`function_call_output` and
-  `custom_tool_call`/`custom_tool_call_output` shapes generically.
+- **Nothing in Console → Observe:** set `ONE_SIGNAL_CODEX_DEBUG=1`, run a
+  Codex turn, then check `~/.codex/one-signal-hook.log`. A line like
+  `ingest failed: HTTP 401` means the hook is wired correctly but the token
+  is wrong/inactive; `Processed N/M turns` with no error means it uploaded.
+- **Hook not firing at all:** confirm `codex features list` shows `hooks …
+  true`, and that `~/.codex/config.toml` has
+  `[plugins."one-signal-codex@one-infra"] enabled = true` (added by
+  `codex plugin add`). Newly installed hooks may need to be trusted the first
+  time Codex runs them.
+- **`403 token_inactive` / `401`:** the token in `~/.codex/one-signal.json`
+  (or `ONE_SIGNAL_API_TOKEN`) is invalid or inactive — regenerate it in
+  Console → Access tokens.
+- **`503 signal_not_configured`:** your organization hasn't connected
+  Langfuse yet — do that in Console → Integrations.
+- **Only the last turn is missing:** expected — see the Stop-hook flush note
+  above; it uploads on the session's next Stop hook.
 
 ## Self-test
 
@@ -158,6 +209,6 @@ python3 plugins/one-signal-codex/one_signal_codex_hook.py --self-test
 ```
 
 Runs the parser/assembly pipeline against a bundled fixture rollout
-(`fixtures/sample_rollout.jsonl`) with no network calls, asserting the
-built batch's event types, tool-span metadata, usage details, and that no
+(`fixtures/sample_rollout.jsonl`) with no network calls, asserting the built
+batch's event types, tool-span metadata, usage details, and that no
 encrypted reasoning content ever leaks into an event.
