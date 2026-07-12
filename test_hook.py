@@ -16,6 +16,8 @@ Run this file with:
     uv run python -m unittest test_hook -v
 """
 
+import copy
+import hashlib
 import json
 import io
 import sys
@@ -126,7 +128,7 @@ class TestParsingPipeline(unittest.TestCase):
         self.assertEqual(trace["body"]["metadata"]["skill_names"], ["code-review"])
         self.assertIn("skill:code-review", trace["body"]["tags"])
 
-    def test_first_turn_uploads_global_and_project_instruction_documents(self):
+    def test_uploads_only_codex_instructions_and_preserves_symlink_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             project = home / "work" / "project"
@@ -138,7 +140,8 @@ class TestParsingPipeline(unittest.TestCase):
             (home / ".codex" / "AGENTS.md").write_text("global agents", encoding="utf-8")
             (home / ".claude" / "CLAUDE.md").write_text("global claude", encoding="utf-8")
             (project / "AGENTS.md").write_text("project agents", encoding="utf-8")
-            (nested / "CLAUDE.md").write_text("nested claude", encoding="utf-8")
+            (project / "CLAUDE.md").symlink_to("AGENTS.md")
+            (nested / "AGENTS.md").write_text("nested agents", encoding="utf-8")
             turn = self.turns[0]
             turn.cwd = str(nested)
 
@@ -149,14 +152,65 @@ class TestParsingPipeline(unittest.TestCase):
             documents = trace["body"]["metadata"]["instruction_documents"]
             self.assertEqual([document["path"] for document in documents], [
                 "~/.codex/AGENTS.md",
-                "~/.claude/CLAUDE.md",
                 "AGENTS.md",
-                "packages/app/CLAUDE.md",
+                "packages/app/AGENTS.md",
             ])
+            self.assertEqual(documents[1], {
+                "agent": "codex",
+                "path": "AGENTS.md",
+                "scope": "project",
+                "directory_scope": ".",
+                "content": "project agents",
+                "content_hash": hashlib.sha256(b"project agents").hexdigest(),
+            })
 
-            later = hook.build_turn_events(THREAD_ID, 2, turn, FIXTURE)
-            later_trace = next(event for event in later if event["type"] == "trace-create")
-            self.assertNotIn("instruction_documents", later_trace["body"]["metadata"])
+    def test_later_turn_uploads_only_new_nested_instruction_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            project = home / "project"
+            nested = project / "packages" / "app"
+            (project / ".git").mkdir(parents=True)
+            nested.mkdir(parents=True)
+            (home / ".codex").mkdir()
+            (project / "AGENTS.md").write_text("root rules", encoding="utf-8")
+            (nested / "AGENTS.md").write_text("nested rules", encoding="utf-8")
+            first = copy.deepcopy(self.turns[0])
+            first.cwd = str(project)
+            later = copy.deepcopy(self.turns[0])
+            later.cwd = str(project)
+            later.rounds[0].tool_calls = [{
+                "call_id": "touch-nested",
+                "name": "exec_command",
+                "input": json.dumps({"cmd": "pwd", "workdir": str(nested)}),
+            }]
+            known: set[str] = set()
+
+            with mock.patch.object(hook, "CODEX_HOME", home / ".codex"), mock.patch.object(hook.Path, "home", return_value=home):
+                first_events = hook.build_turn_events(THREAD_ID, 1, first, FIXTURE, known_instruction_documents=known)
+                later_events = hook.build_turn_events(THREAD_ID, 2, later, FIXTURE, known_instruction_documents=known)
+
+            first_documents = next(event for event in first_events if event["type"] == "trace-create")["body"]["metadata"]["instruction_documents"]
+            later_documents = next(event for event in later_events if event["type"] == "trace-create")["body"]["metadata"]["instruction_documents"]
+            self.assertEqual([document["path"] for document in first_documents], ["AGENTS.md"])
+            self.assertEqual([document["path"] for document in later_documents], ["packages/app/AGENTS.md"])
+
+    def test_records_images_omitted_from_session_text(self):
+        turn_id = "turn-with-image"
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "inspect this"}, {"type": "input_image", "image_url": "data:image/png;base64,abc"}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+            }}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "event_msg", "payload": {"type": "user_message", "message": "inspect this"}}, 3),
+            ({"timestamp": "2026-07-12T00:00:03Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id, "last_agent_message": "done"}}, 4),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+        trace = next(event for event in events if event["type"] == "trace-create")
+        self.assertEqual(trace["body"]["metadata"]["omitted_image_count"], 1)
 
     def test_tool_outputs_only_report_reliable_exit_codes(self):
         turn_id = "turn-tool-outcomes"
