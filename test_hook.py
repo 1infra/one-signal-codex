@@ -532,6 +532,13 @@ class TestStopHookEntrypoint(unittest.TestCase):
 
 
 class TestPluginHookConfiguration(unittest.TestCase):
+    def test_marketplace_local_source_uses_relative_path(self):
+        config_path = Path(__file__).resolve().parent / ".agents" / "plugins" / "marketplace.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        source = config["plugins"][0]["source"]
+
+        self.assertEqual(source, {"source": "local", "path": "./"})
+
     def test_stop_hook_resolves_entrypoint_from_plugin_root(self):
         config_path = Path(__file__).resolve().parent / "hooks" / "hooks.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
