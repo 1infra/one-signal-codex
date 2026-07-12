@@ -188,7 +188,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-PLUGIN_VERSION = "0.0.1"
+PLUGIN_VERSION = "0.1.1"
 
 # --- Paths ---
 def _codex_home() -> Path:
@@ -218,6 +218,7 @@ except ValueError:
 # hook -- mirrors Langfuse's own /api/public/ingestion batch-size limits).
 MAX_EVENTS_PER_BATCH = 200
 MAX_BYTES_PER_BATCH = 3_500_000
+ROLLOUT_FLUSH_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
 
 # ----------------- Logging -----------------
 _logger: Optional[logging.Logger] = None
@@ -656,6 +657,35 @@ def read_new_lines(rollout_path: Path, start_offset: int) -> List[Tuple[Dict[str
         rows.append((row, pos))
 
     return rows
+
+
+def read_completed_turns_after_flush(
+    rollout_path: Path, start_offset: int
+) -> Tuple[List[Tuple[Dict[str, Any], int]], List["Turn"]]:
+    rows = read_new_lines(rollout_path, start_offset)
+    if not rows:
+        return rows, []
+
+    # Codex can invoke Stop just before it appends task_complete. Re-read for
+    # a short bounded window so a session's final turn uploads on this Stop
+    # instead of waiting for another turn that may never happen.
+    for delay in ROLLOUT_FLUSH_DELAYS:
+        latest_started: Optional[str] = None
+        completed: set[str] = set()
+        for row, _ in rows:
+            payload = row.get("payload")
+            if row.get("type") != "event_msg" or not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "task_started" and isinstance(payload.get("turn_id"), str):
+                latest_started = payload["turn_id"]
+            elif payload.get("type") == "task_complete" and isinstance(payload.get("turn_id"), str):
+                completed.add(payload["turn_id"])
+        if latest_started is None or latest_started in completed:
+            break
+        time.sleep(delay)
+        rows = read_new_lines(rollout_path, start_offset) or rows
+
+    return rows, build_turns(rows)
 
 # ----------------- Turn assembly -----------------
 @dataclass
@@ -1446,12 +1476,11 @@ def main(argv: List[str]) -> int:
             offset = int(entry.get("offset", 0))
             turn_count = int(entry.get("turn_count", 0))
 
-            rows = read_new_lines(rollout_path, offset)
+            rows, turns = read_completed_turns_after_flush(rollout_path, offset)
             if not rows:
                 save_state(state)
                 return 0
 
-            turns = build_turns(rows)
             if not turns:
                 save_state(state)
                 return 0

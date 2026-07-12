@@ -126,14 +126,11 @@ neither. State (byte offset + turn count per session) lives under
   with no `task_complete` seen yet is left for the next run). Deterministic
   trace/observation IDs (`<thread_id>-t<turn_number>`) make retries
   idempotent upserts, not duplicates.
-- **Stop-hook flush timing / self-heal:** the `Stop` hook can fire a beat
-  before Codex has fully flushed the just-finished turn to the rollout (the
-  `task_complete` marker isn't there yet). When that happens the hook finds
-  no complete turn and exits cleanly without advancing the checkpoint, so the
-  turn is picked up by the **next** Stop hook of the same session — verified
-  live: turn 1 uploaded on turn 2's Stop hook. Multi-turn sessions therefore
-  self-heal; a session's final turn uploads on its next Stop fire (e.g. when
-  resumed).
+- **Stop-hook flush timing:** Codex can fire `Stop` just before the completed
+  turn reaches the rollout file. The hook re-reads for a short bounded window
+  so the session's final turn uploads during the same Stop invocation. If the
+  file still has not completed, the checkpoint stays put and a later Stop can
+  retry safely.
 - If your organization hasn't connected Langfuse yet, the proxy responds
   `503 signal_not_configured`; the hook logs a hint and exits cleanly
   without advancing the checkpoint, so it retries automatically once Langfuse
@@ -167,8 +164,6 @@ via `ONE_SIGNAL_CODEX_MAX_CHARS`.
   Console → Access tokens.
 - **`503 signal_not_configured`:** your organization hasn't connected
   Langfuse yet — do that in Console → Integrations.
-- **Only the last turn is missing:** expected — see the Stop-hook flush note
-  above; it uploads on the session's next Stop hook.
 
 ## Self-test
 
