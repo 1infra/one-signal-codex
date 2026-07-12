@@ -128,9 +128,14 @@ neither. State (byte offset + turn count per session) lives under
   idempotent upserts, not duplicates.
 - **Stop-hook flush timing:** Codex can fire `Stop` just before the completed
   turn reaches the rollout file. The hook re-reads for a short bounded window
-  so the session's final turn uploads during the same Stop invocation. If the
-  file still has not completed, the checkpoint stays put and a later Stop can
-  retry safely.
+  so the session's final turn usually uploads complete during the same Stop
+  invocation. If the file still has not completed, it uploads an in-progress
+  trace immediately without advancing the checkpoint; a later Stop overwrites
+  the same deterministic IDs with the completed version. Interrupted turns
+  are finalized with `aborted: true`.
+- **Transient delivery failures:** network errors, HTTP 429, and HTTP 5xx are
+  retried up to three times inside the same Hook run. The checkpoint advances
+  only after every event for a completed turn is accepted upstream.
 - If your organization hasn't connected Langfuse yet, the proxy responds
   `503 signal_not_configured`; the hook logs a hint and exits cleanly
   without advancing the checkpoint, so it retries automatically once Langfuse

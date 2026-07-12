@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/plugins/cache/one-infra/one-signal-codex/0.1.1/one_signal_codex_hook.py\"",
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/plugins/cache/one-infra/one-signal-codex/0.1.2/one_signal_codex_hook.py\"",
             "timeout": 30,
             "statusMessage": "Uploading Codex turn to One Signal"
           }

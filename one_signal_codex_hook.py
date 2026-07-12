@@ -188,7 +188,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-PLUGIN_VERSION = "0.1.1"
+PLUGIN_VERSION = "0.1.2"
 
 # --- Paths ---
 def _codex_home() -> Path:
@@ -712,11 +712,13 @@ class Turn:
     cwd: Optional[str] = None
     last_agent_message: Optional[str] = None
     completed_ts: Optional[datetime] = None
+    last_event_ts: Optional[datetime] = None
     duration_ms: Optional[int] = None
     rounds: List[TurnRound] = field(default_factory=list)
     skills: List[str] = field(default_factory=list)
     pending_skills: List[Tuple[str, str]] = field(default_factory=list)
     complete: bool = False
+    aborted: bool = False
 
 def _normalize_tool_call(payload: Dict[str, Any], ts: Optional[datetime]) -> Dict[str, Any]:
     return {
@@ -931,7 +933,7 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
                 })
             continue
 
-        if row_type == "event_msg" and payload.get("type") == "task_complete":
+        if row_type == "event_msg" and payload.get("type") in ("task_complete", "turn_aborted"):
             tid = payload.get("turn_id")
             turn = open_turns.pop(tid, None) if isinstance(tid, str) else None
             if turn is None:
@@ -939,9 +941,11 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
             attach_usage(turn)
             turn.last_agent_message = payload.get("last_agent_message")
             turn.completed_ts = parse_timestamp(row.get("timestamp"))
+            turn.last_event_ts = turn.completed_ts
             turn.duration_ms = payload.get("duration_ms")
             turn.end_offset = row_offset
             turn.complete = True
+            turn.aborted = payload.get("type") == "turn_aborted"
             turns.append(turn)
             pending_tool_calls.pop(tid, None)
             pending_usage.pop(tid, None)
@@ -1033,6 +1037,16 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
             continue
 
         # Unknown response_item subtype -- ignore.
+
+    if open_turns:
+        # Match Langfuse's behavior: expose the newest in-progress turn now,
+        # but leave it uncommitted so the next Stop can overwrite the same
+        # deterministic trace/observation ids with the completed version.
+        turn = list(open_turns.values())[-1]
+        attach_usage(turn)
+        turn.last_event_ts = parse_timestamp(rows[-1][0].get("timestamp"))
+        turn.end_offset = rows[-1][1]
+        turns.append(turn)
 
     return turns
 
@@ -1139,7 +1153,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
     )
     final_text, _ = truncate_text(final_text_raw)
 
-    turn_end_ts = turn.completed_ts
+    turn_end_ts = turn.completed_ts or turn.last_event_ts
     turn_metadata: Dict[str, Any] = {
         "source": "codex-cli",
         "thread_id": thread_id,
@@ -1148,6 +1162,8 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
         "rollout_path": str(rollout_path),
         "user_text": user_text_meta,
         "round_count": len(turn.rounds),
+        "completed": turn.complete,
+        "aborted": turn.aborted,
     }
     if turn.cwd:
         turn_metadata["cwd"] = turn.cwd
@@ -1332,8 +1348,9 @@ def _extract_ingestion_errors(body: bytes) -> List[Dict[str, Any]]:
         return []
     return [e for e in errors if isinstance(e, dict)]
 
-def post_batch(events: List[Dict[str, Any]], base_url: str, api_token: str,
-               metadata: Dict[str, Any]) -> bool:
+def _post_batch_once(events: List[Dict[str, Any]], base_url: str, api_token: str,
+                     metadata: Dict[str, Any]) -> Tuple[bool, bool]:
+    """Return (accepted, retryable)."""
     url = base_url.rstrip("/") + "/api/v1/observe/ingest"
     payload = json.dumps({"batch": events, "metadata": metadata}, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -1346,7 +1363,7 @@ def post_batch(events: List[Dict[str, Any]], base_url: str, api_token: str,
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             status = resp.getcode()
             body = resp.read()
             if status == 207:
@@ -1357,13 +1374,13 @@ def post_batch(events: List[Dict[str, Any]], base_url: str, api_token: str,
                         f"id={err.get('id')} status={err.get('status')} message={err.get('message')}"
                     )
                 debug(f"ingest ok: status={status} events={len(events)} failed={len(errors)}")
-                return len(errors) == 0
+                return len(errors) == 0, False
             elif 200 <= status < 300:
                 debug(f"ingest ok: status={status} events={len(events)}")
-                return True
+                return True, False
             else:
                 info(f"ingest unexpected status {status}: {body[:500]!r}")
-                return False
+                return False, status == 429 or status >= 500
     except urllib.error.HTTPError as e:
         body = e.read()
         if e.code == 503:
@@ -1380,15 +1397,31 @@ def post_batch(events: List[Dict[str, Any]], base_url: str, api_token: str,
                     "One Signal is not connected for this organization yet -- "
                     "connect Langfuse in Console -> Integrations. Dropping this batch."
                 )
-                return False
+                return False, False
         info(f"ingest failed: HTTP {e.code}: {body[:500]!r}")
-        return False
+        return False, e.code == 429 or e.code >= 500
     except urllib.error.URLError as e:
         debug(f"ingest network error: {e}")
-        return False
+        return False, True
     except Exception as e:
         debug(f"ingest request failed unexpectedly: {type(e).__name__}: {e}")
-        return False
+        return False, False
+
+
+def post_batch(events: List[Dict[str, Any]], base_url: str, api_token: str,
+               metadata: Dict[str, Any]) -> bool:
+    for attempt, delay in enumerate((0, 0.25, 0.75)):
+        if delay:
+            time.sleep(delay)
+        accepted, retryable = _post_batch_once(events, base_url, api_token, metadata)
+        if accepted:
+            return True
+        if not retryable:
+            return False
+        if attempt == 2:
+            return False
+        debug(f"retrying ingest after transient failure (attempt {attempt + 2}/3)")
+    return False
 
 def deliver(events: List[Dict[str, Any]], event_turn_idx: List[int], base_url: str, api_token: str) -> set:
     chunk_idx_groups = chunk_indices(events)
@@ -1503,15 +1536,15 @@ def main(argv: List[str]) -> int:
             accepted_idx = deliver(events, event_turn_idx, base_url, api_token) if events else set()
 
             for i in range(len(turns)):
-                if i in accepted_idx:
+                if turns[i].complete and i in accepted_idx:
                     committed = i + 1
                 else:
                     break
 
             if committed < emitted:
                 info(
-                    f"only {committed}/{emitted} turn(s) fully accepted upstream this run; "
-                    "checkpoint held back so the rest retry next time"
+                    f"only {committed}/{emitted} completed turn(s) committed this run; "
+                    "in-progress or rejected turns retry next time"
                 )
 
             if committed > 0:

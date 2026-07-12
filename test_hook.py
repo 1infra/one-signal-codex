@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -186,6 +187,22 @@ class TestParsingPipeline(unittest.TestCase):
 
         self.assertEqual(tool["metadata"]["result_status"], "error")
 
+    def test_aborted_turn_is_emitted_as_completed_warning(self):
+        turn_id = "turn-aborted"
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "event_msg", "payload": {"type": "user_message", "message": "stop this"}}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "event_msg", "payload": {"type": "turn_aborted", "turn_id": turn_id}}, 3),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        trace = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)[0]
+
+        self.assertTrue(turn.complete)
+        self.assertTrue(turn.aborted)
+        self.assertEqual(trace["body"]["metadata"]["completed"], True)
+        self.assertEqual(trace["body"]["metadata"]["aborted"], True)
+
 
 class TestEventAssembly(unittest.TestCase):
     def setUp(self):
@@ -330,6 +347,40 @@ class TestChunking(unittest.TestCase):
             self.assertLessEqual(len(g), 200)
 
 
+class TestTransport(unittest.TestCase):
+    def test_transient_network_error_retries_before_succeeding(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return b"{}"
+
+        with (
+            mock.patch.object(
+                hook.urllib.request,
+                "urlopen",
+                side_effect=[urllib.error.URLError("temporary"), Response()],
+            ) as urlopen,
+            mock.patch.object(hook.time, "sleep"),
+        ):
+            accepted = hook.post_batch(
+                [{"id": "event-1", "type": "trace-create", "body": {}}],
+                "https://example.test",
+                "oc_test",
+                {},
+            )
+
+        self.assertTrue(accepted)
+        self.assertEqual(urlopen.call_count, 2)
+
+
 class TestSelfTestEntrypoint(unittest.TestCase):
     def test_run_self_test_returns_zero(self):
         self.assertEqual(hook.run_self_test(), 0)
@@ -375,6 +426,66 @@ class TestStopHookEntrypoint(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertEqual([event["type"] for event in delivered].count("trace-create"), 1)
+
+    def test_in_progress_turn_uploads_without_advancing_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = root / f"rollout-{THREAD_ID}.jsonl"
+            state_dir = root / "state"
+            turn_id = "turn-in-progress"
+            rows = [
+                {"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
+                {"timestamp": "2026-07-12T00:00:01Z", "type": "event_msg", "payload": {"type": "user_message", "message": "hello"}},
+                {"timestamp": "2026-07-12T00:00:02Z", "type": "event_msg", "payload": {"type": "agent_message", "message": "working"}},
+            ]
+            rollout.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            delivered = []
+            payload = json.dumps({"session_id": THREAD_ID, "transcript_path": str(rollout)})
+
+            with (
+                mock.patch.object(hook, "STATE_DIR", state_dir),
+                mock.patch.object(hook, "STATE_FILE", state_dir / "state.json"),
+                mock.patch.object(hook, "LOCK_FILE", state_dir / "state.lock"),
+                mock.patch.object(hook, "ROLLOUT_FLUSH_DELAYS", ()),
+                mock.patch.object(hook, "resolve_config", return_value=("https://example.test", "oc_test", None)),
+                mock.patch.object(hook, "deliver", side_effect=lambda events, *_: delivered.extend(events) or {0}),
+                mock.patch.object(sys, "stdin", io.StringIO(payload)),
+            ):
+                result = hook.main(["one_signal_codex_hook.py"])
+
+            trace = next(event for event in delivered if event["type"] == "trace-create")
+            state_entries = [value for key, value in json.loads((state_dir / "state.json").read_text()).items() if key != "_thread_paths"]
+            self.assertEqual(result, 0)
+            self.assertEqual(trace["body"]["id"], f"{THREAD_ID}-t1")
+            self.assertEqual(trace["body"]["metadata"]["completed"], False)
+            self.assertEqual(state_entries[0]["offset"], 0)
+            self.assertEqual(state_entries[0]["turn_count"], 0)
+
+            complete = {
+                "timestamp": "2026-07-12T00:00:03Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": turn_id, "last_agent_message": "done"},
+            }
+            with rollout.open("a", encoding="utf-8") as output:
+                output.write(json.dumps(complete) + "\n")
+            finalized = []
+            with (
+                mock.patch.object(hook, "STATE_DIR", state_dir),
+                mock.patch.object(hook, "STATE_FILE", state_dir / "state.json"),
+                mock.patch.object(hook, "LOCK_FILE", state_dir / "state.lock"),
+                mock.patch.object(hook, "ROLLOUT_FLUSH_DELAYS", ()),
+                mock.patch.object(hook, "resolve_config", return_value=("https://example.test", "oc_test", None)),
+                mock.patch.object(hook, "deliver", side_effect=lambda events, *_: finalized.extend(events) or {0}),
+                mock.patch.object(sys, "stdin", io.StringIO(payload)),
+            ):
+                hook.main(["one_signal_codex_hook.py"])
+
+            final_trace = next(event for event in finalized if event["type"] == "trace-create")
+            final_entries = [value for key, value in json.loads((state_dir / "state.json").read_text()).items() if key != "_thread_paths"]
+            self.assertEqual(final_trace["body"]["id"], trace["body"]["id"])
+            self.assertEqual(final_trace["body"]["metadata"]["completed"], True)
+            self.assertGreater(final_entries[0]["offset"], 0)
+            self.assertEqual(final_entries[0]["turn_count"], 1)
 
 
 if __name__ == "__main__":
