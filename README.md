@@ -71,6 +71,7 @@ first, then `~/.codex/one-signal.json`.**
 | User ID | `ONE_SIGNAL_USER_ID` | `ONE_SIGNAL_USER_ID` | Optional. User identifier attached to every trace. |
 | Debug logging | `ONE_SIGNAL_CODEX_DEBUG=1` | — | Verbose logging to `~/.codex/one-signal-hook.log`. |
 | Truncation | `ONE_SIGNAL_CODEX_MAX_CHARS` | — | Truncate captured inputs/outputs to this many characters. Default `20000`. |
+| Instruction documents | `ONE_SIGNAL_CODEX_INSTRUCTION_DOCUMENTS` | — | Upload active global and project `AGENTS.md` / `CLAUDE.md` files on the first turn for Intelligence compliance analysis. Default `true`. |
 
 Env vars override the file, so you can keep the token in the file and
 override the base URL per shell (or vice versa). `CODEX_HOME` is respected
@@ -111,6 +112,12 @@ sources filter alike in Console → Observe: skills invoked in the turn
 `skill:<name>` trace tags plus a `skill_names` metadata list, and MCP tool
 calls become `mcp:<server>:<tool>` trace tags with `mcp_server` / `mcp_tool`
 recorded on that tool's span metadata.
+
+On the first turn, the hook also attaches the active `~/.codex/AGENTS.md`,
+`~/.claude/CLAUDE.md`, and project-level `AGENTS.md` / `CLAUDE.md` files so
+Intelligence can evaluate instruction compliance. Collection is capped at 20
+files, 64,000 characters per file, and 256,000 characters total. Set
+`ONE_SIGNAL_CODEX_INSTRUCTION_DOCUMENTS=false` to disable it.
 
 The same hook script also accepts the legacy `notify` argv payload (thread
 id, no transcript path — it globs `sessions/**/*-<thread-id>.jsonl`), and
