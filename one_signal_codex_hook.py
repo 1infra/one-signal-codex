@@ -11,8 +11,34 @@ a derivative of the Claude hook's parsing code.
 --------------------------------------------------------------------------
 How Codex invokes this
 --------------------------------------------------------------------------
-Codex CLI's `notify` config (~/.codex/config.toml: `notify = ["python3",
-"<abs path to this file>"]`) spawns this script ONCE per completed agent
+Two transports feed this same hook; it auto-detects which one fired.
+
+(A) Plugin `Stop` hook -- the PRIMARY, marketplace path (see
+../one-signal-codex/README.md and .codex-plugin/plugin.json +
+hooks/hooks.json). When the plugin is installed via `codex plugin
+marketplace add 1infra/1Infra` + `codex plugin add one-signal-codex@one-infra`,
+Codex runs the plugin's declared Stop `command` after every turn and pipes a
+JSON object to STDIN (verified against codex-cli 0.144.1):
+
+    {
+      "session_id": "<uuid, == the rollout filename's trailing UUID>",
+      "turn_id": "<uuid>",
+      "transcript_path": "<abs path to the rollout jsonl>",
+      "cwd": "<turn cwd>",
+      "model": "<model slug>",
+      "last_assistant_message": "<final assistant text>" | null,
+      "hook_event_name": "Stop",
+      ...
+    }
+
+Unlike notify, this DOES carry `transcript_path` directly, so the rollout is
+used as-is (no glob). This path fires under Codex's now-stable `hooks`
+feature -- the older `plugin_hooks` feature flag is REMOVED on 0.144.1 and
+is not required (verified: the Stop hook fires with `plugin_hooks=false`).
+
+(B) Legacy `notify` config (~/.codex/config.toml: `notify = ["python3",
+"<abs path to this file>"]`, written by install.py) -- the manual/alternative
+path -- spawns this script ONCE per completed agent
 turn and appends exactly one argv: a JSON payload. Verified against
 installed `codex-cli 0.144.1` and against the source
 (codex-rs/hooks/src/legacy_notify.rs, `UserNotification::AgentTurnComplete`,
@@ -138,6 +164,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -354,7 +381,98 @@ def extract_thread_id(payload: Dict[str, Any]) -> Optional[str]:
         or payload.get("session_id")
     )
 
+# ----------------- Plugin `Stop` hook payload (stdin) -----------------
+def read_stop_payload() -> Dict[str, Any]:
+    """Codex's plugin `Stop` hook (config.toml `[features] plugin_hooks =
+    true` + an enabled plugin whose hooks.json declares a Stop `command`)
+    pipes a JSON object to stdin instead of an argv:
+
+        {"session_id": "<uuid>", "turn_id": "<uuid>",
+         "transcript_path": "<abs path to the rollout jsonl>",
+         "hook_event_name": "Stop"}
+
+    (Shape verified against langfuse/codex-observability-plugin's HookInput
+    type and codex-cli 0.144.1.) Unlike the legacy `notify` argv, this DOES
+    carry the rollout path directly, so we don't need to glob for it.
+
+    Best-effort: returns {} for an interactive tty, empty, or unparseable
+    stdin so the legacy notify/argv path is never disturbed."""
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}
+        raw = sys.stdin.read()
+    except Exception as e:
+        debug(f"read_stop_payload read exception: {e!r}")
+        return {}
+    raw = (raw or "").strip()
+    if not raw:
+        debug("no stop-hook payload on stdin")
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            debug(f"stop payload keys: {sorted(parsed.keys())}")
+            return parsed
+    except Exception as e:
+        debug(f"read_stop_payload parse exception: {e!r}")
+    return {}
+
 # ----------------- Rollout file discovery -----------------
+def thread_id_from_path(rollout_path: Path) -> Optional[str]:
+    """Best-effort thread id for a rollout whose trigger payload didn't carry
+    one: prefer the `session_meta` id on the first line, else the trailing
+    UUID in the filename (`rollout-<ts>-<uuid>.jsonl`)."""
+    try:
+        with rollout_path.open("r", encoding="utf-8") as fh:
+            obj = json.loads(fh.readline())
+        payload = obj.get("payload", obj) if isinstance(obj, dict) else {}
+        sid = payload.get("id") or payload.get("session_id")
+        if sid:
+            return str(sid)
+    except Exception as e:
+        debug(f"thread_id_from_path first-line read failed: {e!r}")
+    m = re.search(r"[0-9a-fA-F-]{36}$", rollout_path.stem)
+    return m.group(0) if m else None
+
+def newest_rollout() -> Optional[Path]:
+    """Last-resort discovery when neither a thread id nor a transcript_path is
+    available: the most recently modified rollout file on disk. Lets the hook
+    still capture the current session under payload variants that omit both."""
+    if not SESSIONS_DIR.exists():
+        debug(f"sessions dir does not exist: {SESSIONS_DIR}")
+        return None
+    candidates = list(SESSIONS_DIR.rglob("rollout-*.jsonl"))
+    if not candidates:
+        debug("no rollout files found for newest-rollout fallback")
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+def resolve_rollout(
+    thread_id: Optional[str],
+    transcript_hint: Optional[str],
+    state: Dict[str, Any],
+) -> Optional[Path]:
+    """Resolve the rollout file from whichever trigger fired, in priority:
+      1. `transcript_path` handed to us directly by the plugin Stop hook.
+      2. `thread-id` (notify argv or Stop payload) -> cached path or glob.
+      3. newest rollout on disk (fallback).
+    Caches a resolved (thread_id -> path) mapping into `state` when both
+    are known, matching find_rollout_path's cache discipline."""
+    if transcript_hint:
+        p = Path(transcript_hint).expanduser()
+        if p.exists():
+            if thread_id:
+                cache = state.setdefault("_thread_paths", {})
+                cache[thread_id] = str(p)
+            return p
+        debug(f"transcript_path does not exist, falling through: {transcript_hint}")
+    if thread_id:
+        found = find_rollout_path(thread_id, state)
+        if found is not None:
+            return found
+    return newest_rollout()
+
+
 def find_rollout_path(thread_id: str, state: Dict[str, Any]) -> Optional[Path]:
     """Resolve thread_id -> rollout file path. The notify payload never
     carries the path (verified against codex-rs/hooks/src/legacy_notify.rs),
@@ -1114,11 +1232,17 @@ def main(argv: List[str]) -> int:
         debug("Missing ONE_SIGNAL_API_TOKEN; exiting without emitting.")
         return 0
 
-    payload = read_notify_payload(argv)
-    thread_id = extract_thread_id(payload)
+    # Two supported transports feed the same pipeline:
+    #   - legacy `notify` argv (install.py path): thread-id, no rollout path;
+    #   - plugin `Stop` hook stdin: session_id + transcript_path directly.
+    # argv/stdin reads are lock-free; the rollout is resolved under the lock.
+    notify = read_notify_payload(argv)
+    thread_id = extract_thread_id(notify)
+    transcript_hint: Optional[str] = None
     if not thread_id:
-        debug("Missing thread-id in notify payload; exiting.")
-        return 0
+        stop = read_stop_payload()
+        thread_id = extract_thread_id(stop)
+        transcript_hint = stop.get("transcript_path") or stop.get("transcript-path")
 
     emitted = 0
     committed = 0
@@ -1126,11 +1250,16 @@ def main(argv: List[str]) -> int:
     try:
         with FileLock(LOCK_FILE):
             state = load_state()
-            rollout_path = find_rollout_path(thread_id, state)
+            rollout_path = resolve_rollout(thread_id, transcript_hint, state)
             if rollout_path is None:
                 save_state(state)
-                debug(f"could not resolve rollout path for thread_id={thread_id}")
+                debug(
+                    "could not resolve rollout path "
+                    f"(thread_id={thread_id!r}, transcript_hint={transcript_hint!r})"
+                )
                 return 0
+            if not thread_id:
+                thread_id = thread_id_from_path(rollout_path) or "unknown-session"
 
             key = state_key(thread_id, str(rollout_path))
             entry = state.get(key, {})
