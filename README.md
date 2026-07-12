@@ -25,6 +25,10 @@ summary). Traces from Codex CLI and Claude Code render in the same **Console
 
 ## Install
 
+The marketplace install command requires Codex CLI 0.144 or newer. Older
+builds may support hooks and marketplace registration without exposing
+`codex plugin add`; update Codex before installing through the marketplace.
+
 ```bash
 codex plugin marketplace add 1infra/one-signal-codex
 codex plugin add one-signal-codex@one-infra
@@ -85,9 +89,10 @@ export ONE_SIGNAL_API_TOKEN="oc_xxx"   # add to ~/.zshrc / ~/.bashrc to persist
 
 ## Requirements
 
-- **Codex CLI ≥ 0.128** — plugin hooks were introduced here. Verified end to
-  end against **`codex-cli 0.144.1`**, where the `hooks` feature is stable and
-  enabled by default, so no feature flag is required. Check yours with
+- **Codex CLI ≥ 0.144** — this includes both stable hooks and the
+  `codex plugin add` command used above. Verified end to end against
+  **`codex-cli 0.144.1`**, where the `hooks` feature is enabled by default.
+  Check yours with
   `codex --version` and `codex features list` (look for `hooks … stable …
   true`).
 - **Older builds** where `hooks` isn't stable/default-on may need plugin
