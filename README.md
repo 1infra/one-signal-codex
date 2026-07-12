@@ -25,10 +25,6 @@ summary). Traces from Codex CLI and Claude Code render in the same **Console
 
 ## Install
 
-The marketplace install command requires Codex CLI 0.144 or newer. Older
-builds may support hooks and marketplace registration without exposing
-`codex plugin add`; update Codex before installing through the marketplace.
-
 ```bash
 codex plugin marketplace add 1infra/one-signal-codex
 codex plugin add one-signal-codex@one-infra
@@ -38,6 +34,19 @@ mkdir -p ~/.codex && printf '{"ONE_SIGNAL_API_TOKEN":"oc_xxx"}' > ~/.codex/one-s
 Replace `oc_xxx` with your One Connector access token. That's it — start a
 new `codex` session (or run `codex exec "..."`) and your turns show up in
 **Console → Observe**.
+
+Codex 0.128–0.143 supports hooks and marketplace registration but may not
+expose `codex plugin add`. On those versions, replace the second command by
+adding this to `~/.codex/config.toml`, matching Langfuse's compatibility
+instructions:
+
+```toml
+[features]
+plugin_hooks = true
+
+[plugins."one-signal-codex@one-infra"]
+enabled = true
+```
 
 - **Line 1** registers this repo as a Codex plugin marketplace (Codex reads
   `.agents/plugins/marketplace.json` at the repo root).
@@ -89,10 +98,9 @@ export ONE_SIGNAL_API_TOKEN="oc_xxx"   # add to ~/.zshrc / ~/.bashrc to persist
 
 ## Requirements
 
-- **Codex CLI ≥ 0.144** — this includes both stable hooks and the
-  `codex plugin add` command used above. Verified end to end against
-  **`codex-cli 0.144.1`**, where the `hooks` feature is enabled by default.
-  Check yours with
+- **Codex CLI ≥ 0.128** — plugin hooks were introduced here. Codex 0.144+
+  includes the `codex plugin add` command used above and enables hooks by
+  default. Check yours with
   `codex --version` and `codex features list` (look for `hooks … stable …
   true`).
 - **Older builds** where `hooks` isn't stable/default-on may need plugin
