@@ -20,8 +20,6 @@ import json
 import io
 import sys
 import tempfile
-import threading
-import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -387,46 +385,6 @@ class TestSelfTestEntrypoint(unittest.TestCase):
 
 
 class TestStopHookEntrypoint(unittest.TestCase):
-    def test_stop_waits_for_task_complete_before_uploading(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            rollout = root / f"rollout-{THREAD_ID}.jsonl"
-            state_dir = root / "state"
-            turn_id = "turn-delayed-complete"
-            initial_rows = [
-                {"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
-                {"timestamp": "2026-07-12T00:00:01Z", "type": "event_msg", "payload": {"type": "user_message", "message": "hello"}},
-            ]
-            rollout.write_text("".join(json.dumps(row) + "\n" for row in initial_rows), encoding="utf-8")
-
-            def finish_turn():
-                time.sleep(0.05)
-                row = {
-                    "timestamp": "2026-07-12T00:00:02Z",
-                    "type": "event_msg",
-                    "payload": {"type": "task_complete", "turn_id": turn_id, "last_agent_message": "done"},
-                }
-                with rollout.open("a", encoding="utf-8") as output:
-                    output.write(json.dumps(row) + "\n")
-
-            delivered = []
-            writer = threading.Thread(target=finish_turn)
-            writer.start()
-            payload = json.dumps({"session_id": THREAD_ID, "transcript_path": str(rollout)})
-            with (
-                mock.patch.object(hook, "STATE_DIR", state_dir),
-                mock.patch.object(hook, "STATE_FILE", state_dir / "state.json"),
-                mock.patch.object(hook, "LOCK_FILE", state_dir / "state.lock"),
-                mock.patch.object(hook, "resolve_config", return_value=("https://example.test", "oc_test", None)),
-                mock.patch.object(hook, "deliver", side_effect=lambda events, *_: delivered.extend(events) or {0}),
-                mock.patch.object(sys, "stdin", io.StringIO(payload)),
-            ):
-                result = hook.main(["one_signal_codex_hook.py"])
-            writer.join()
-
-            self.assertEqual(result, 0)
-            self.assertEqual([event["type"] for event in delivered].count("trace-create"), 1)
-
     def test_in_progress_turn_uploads_without_advancing_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -446,7 +404,6 @@ class TestStopHookEntrypoint(unittest.TestCase):
                 mock.patch.object(hook, "STATE_DIR", state_dir),
                 mock.patch.object(hook, "STATE_FILE", state_dir / "state.json"),
                 mock.patch.object(hook, "LOCK_FILE", state_dir / "state.lock"),
-                mock.patch.object(hook, "ROLLOUT_FLUSH_DELAYS", ()),
                 mock.patch.object(hook, "resolve_config", return_value=("https://example.test", "oc_test", None)),
                 mock.patch.object(hook, "deliver", side_effect=lambda events, *_: delivered.extend(events) or {0}),
                 mock.patch.object(sys, "stdin", io.StringIO(payload)),
@@ -473,7 +430,6 @@ class TestStopHookEntrypoint(unittest.TestCase):
                 mock.patch.object(hook, "STATE_DIR", state_dir),
                 mock.patch.object(hook, "STATE_FILE", state_dir / "state.json"),
                 mock.patch.object(hook, "LOCK_FILE", state_dir / "state.lock"),
-                mock.patch.object(hook, "ROLLOUT_FLUSH_DELAYS", ()),
                 mock.patch.object(hook, "resolve_config", return_value=("https://example.test", "oc_test", None)),
                 mock.patch.object(hook, "deliver", side_effect=lambda events, *_: finalized.extend(events) or {0}),
                 mock.patch.object(sys, "stdin", io.StringIO(payload)),

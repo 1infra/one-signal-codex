@@ -126,13 +126,11 @@ neither. State (byte offset + turn count per session) lives under
   with no `task_complete` seen yet is left for the next run). Deterministic
   trace/observation IDs (`<thread_id>-t<turn_number>`) make retries
   idempotent upserts, not duplicates.
-- **Stop-hook flush timing:** Codex can fire `Stop` just before the completed
-  turn reaches the rollout file. The hook re-reads for a short bounded window
-  so the session's final turn usually uploads complete during the same Stop
-  invocation. If the file still has not completed, it uploads an in-progress
-  trace immediately without advancing the checkpoint; a later Stop overwrites
-  the same deterministic IDs with the completed version. Interrupted turns
-  are finalized with `aborted: true`.
+- **Stop-hook timing:** Codex fires `Stop` before appending `task_complete`.
+  Like Langfuse's plugin, this hook uploads the in-progress trace immediately
+  without advancing the checkpoint; a later Stop overwrites the same
+  deterministic IDs with the completed version. Interrupted turns are
+  finalized with `aborted: true`.
 - **Transient delivery failures:** network errors, HTTP 429, and HTTP 5xx are
   retried up to three times inside the same Hook run. The checkpoint advances
   only after every event for a completed turn is accepted upstream.
