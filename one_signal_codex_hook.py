@@ -188,7 +188,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-PLUGIN_VERSION = "0.1.5"
+PLUGIN_VERSION = "0.1.6"
 
 # --- Paths ---
 def _codex_home() -> Path:
