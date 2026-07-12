@@ -531,5 +531,15 @@ class TestStopHookEntrypoint(unittest.TestCase):
             self.assertEqual(final_entries[0]["partial_turn_ids"], [])
 
 
+class TestPluginHookConfiguration(unittest.TestCase):
+    def test_stop_hook_resolves_entrypoint_from_plugin_root(self):
+        config_path = Path(__file__).resolve().parent / "hooks" / "hooks.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        command = config["hooks"]["Stop"][0]["hooks"][0]["command"]
+
+        self.assertEqual(command, 'python3 "${PLUGIN_ROOT}/one_signal_codex_hook.py"')
+        self.assertNotIn("plugins/cache", command)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
