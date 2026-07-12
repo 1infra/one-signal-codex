@@ -126,6 +126,38 @@ class TestParsingPipeline(unittest.TestCase):
         self.assertEqual(trace["body"]["metadata"]["skill_names"], ["code-review"])
         self.assertIn("skill:code-review", trace["body"]["tags"])
 
+    def test_first_turn_uploads_global_and_project_instruction_documents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            project = home / "work" / "project"
+            nested = project / "packages" / "app"
+            (project / ".git").mkdir(parents=True)
+            nested.mkdir(parents=True)
+            (home / ".codex").mkdir()
+            (home / ".claude").mkdir()
+            (home / ".codex" / "AGENTS.md").write_text("global agents", encoding="utf-8")
+            (home / ".claude" / "CLAUDE.md").write_text("global claude", encoding="utf-8")
+            (project / "AGENTS.md").write_text("project agents", encoding="utf-8")
+            (nested / "CLAUDE.md").write_text("nested claude", encoding="utf-8")
+            turn = self.turns[0]
+            turn.cwd = str(nested)
+
+            with mock.patch.object(hook, "CODEX_HOME", home / ".codex"), mock.patch.object(hook.Path, "home", return_value=home):
+                events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+
+            trace = next(event for event in events if event["type"] == "trace-create")
+            documents = trace["body"]["metadata"]["instruction_documents"]
+            self.assertEqual([document["path"] for document in documents], [
+                "~/.codex/AGENTS.md",
+                "~/.claude/CLAUDE.md",
+                "AGENTS.md",
+                "packages/app/CLAUDE.md",
+            ])
+
+            later = hook.build_turn_events(THREAD_ID, 2, turn, FIXTURE)
+            later_trace = next(event for event in later if event["type"] == "trace-create")
+            self.assertNotIn("instruction_documents", later_trace["body"]["metadata"])
+
     def test_tool_outputs_only_report_reliable_exit_codes(self):
         turn_id = "turn-tool-outcomes"
         meta = {"turn_id": turn_id}

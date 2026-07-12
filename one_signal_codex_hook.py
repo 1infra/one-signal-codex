@@ -188,7 +188,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-PLUGIN_VERSION = "0.1.3"
+PLUGIN_VERSION = "0.1.5"
 
 # --- Paths ---
 def _codex_home() -> Path:
@@ -209,6 +209,7 @@ def _env_truthy(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes")
 
 DEBUG = _env_truthy("ONE_SIGNAL_CODEX_DEBUG")
+CAPTURE_INSTRUCTION_DOCUMENTS = (os.environ.get("ONE_SIGNAL_CODEX_INSTRUCTION_DOCUMENTS") or "true").strip().lower() in ("1", "true", "yes")
 try:
     MAX_CHARS = int(os.environ.get("ONE_SIGNAL_CODEX_MAX_CHARS") or "20000")
 except ValueError:
@@ -218,6 +219,9 @@ except ValueError:
 # hook -- mirrors Langfuse's own /api/public/ingestion batch-size limits).
 MAX_EVENTS_PER_BATCH = 200
 MAX_BYTES_PER_BATCH = 3_500_000
+MAX_INSTRUCTION_DOCUMENTS = 20
+MAX_INSTRUCTION_DOCUMENT_CHARS = 64_000
+MAX_INSTRUCTION_DOCUMENTS_CHARS = 256_000
 
 # ----------------- Logging -----------------
 _logger: Optional[logging.Logger] = None
@@ -1090,6 +1094,42 @@ def short_session_label(thread_id: str, max_len: int = 12) -> str:
 def trace_display_name(thread_id: str, turn_num: int) -> str:
     return f"Codex CLI - Turn {turn_num} ({short_session_label(thread_id)})"
 
+def collect_instruction_documents(cwd: Optional[str]) -> List[Dict[str, str]]:
+    """Collect the user and project instruction files that governed this Session."""
+    candidates: List[Tuple[Path, str, str]] = [
+        (CODEX_HOME / "AGENTS.md", "~/.codex/AGENTS.md", "global"),
+        (Path.home() / ".claude" / "CLAUDE.md", "~/.claude/CLAUDE.md", "global"),
+    ]
+    if cwd:
+        current = Path(cwd).expanduser().resolve()
+        project_root = next((path for path in (current, *current.parents) if (path / ".git").exists()), current)
+        directories = list(reversed(current.parents[:len(current.parents) - len(project_root.parents)])) + [current]
+        for directory in directories:
+            for relative in (Path("AGENTS.md"), Path("CLAUDE.md"), Path(".claude/CLAUDE.md")):
+                path = directory / relative
+                label = str(path.relative_to(project_root))
+                candidates.append((path, label, "project"))
+
+    documents: List[Dict[str, str]] = []
+    seen: set[Path] = set()
+    total_chars = 0
+    for path, label, scope in candidates:
+        try:
+            resolved = path.resolve()
+            if resolved in seen or not resolved.is_file():
+                continue
+            content = resolved.read_text(encoding="utf-8", errors="replace")[:MAX_INSTRUCTION_DOCUMENT_CHARS]
+        except (OSError, RuntimeError):
+            continue
+        if not content.strip() or total_chars + len(content) > MAX_INSTRUCTION_DOCUMENTS_CHARS:
+            continue
+        seen.add(resolved)
+        total_chars += len(content)
+        documents.append({"path": label, "scope": scope, "content": content})
+        if len(documents) >= MAX_INSTRUCTION_DOCUMENTS:
+            break
+    return documents
+
 def usage_details_from_token_count(info_blob: Optional[Dict[str, Any]]) -> Optional[Dict[str, int]]:
     """Maps event_msg/token_count.payload.info.last_token_usage to Langfuse
     usageDetails. last_token_usage (not total_token_usage) is the
@@ -1145,6 +1185,10 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
 
     if turn.skills:
         turn_metadata["skill_names"] = turn.skills
+    if turn_num == 1 and CAPTURE_INSTRUCTION_DOCUMENTS:
+        instruction_documents = collect_instruction_documents(turn.cwd)
+        if instruction_documents:
+            turn_metadata["instruction_documents"] = instruction_documents
     mcp_tools = [
         {"server": tc["mcp_server"], "tool": tc["mcp_tool"]}
         for rnd in turn.rounds for tc in rnd.tool_calls
