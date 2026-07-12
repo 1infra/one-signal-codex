@@ -69,6 +69,65 @@ class TestParsingPipeline(unittest.TestCase):
 
         self.assertNotIn("skill_names", trace["body"]["metadata"])
 
+    def test_tool_outputs_only_report_reliable_exit_codes(self):
+        turn_id = "turn-tool-outcomes"
+        meta = {"turn_id": turn_id}
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec", "call_id": "structured", "arguments": "{}", "internal_chat_message_metadata_passthrough": meta}}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "structured", "output": "{\"exit_code\":7,\"output\":\"bad\"}", "internal_chat_message_metadata_passthrough": meta}}, 3),
+            ({"timestamp": "2026-07-12T00:00:03Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec", "call_id": "text", "arguments": "{}", "internal_chat_message_metadata_passthrough": meta}}, 4),
+            ({"timestamp": "2026-07-12T00:00:04Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "text", "output": "Process exited with code 0\n", "internal_chat_message_metadata_passthrough": meta}}, 5),
+            ({"timestamp": "2026-07-12T00:00:05Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec", "call_id": "opaque", "arguments": "{}", "internal_chat_message_metadata_passthrough": meta}}, 6),
+            ({"timestamp": "2026-07-12T00:00:06Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "opaque", "output": "looks good", "internal_chat_message_metadata_passthrough": meta}}, 7),
+            ({"timestamp": "2026-07-12T00:00:07Z", "type": "response_item", "payload": {"type": "function_call", "name": "lookup", "call_id": "business", "arguments": "{}", "internal_chat_message_metadata_passthrough": meta}}, 8),
+            ({"timestamp": "2026-07-12T00:00:08Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "business", "output": "{\"exit_code\":1,\"name\":\"airport\"}", "internal_chat_message_metadata_passthrough": meta}}, 9),
+            ({"timestamp": "2026-07-12T00:00:09Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id}}, 10),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+        tools = {
+            event["body"]["metadata"]["tool_id"]: event["body"]["metadata"]
+            for event in events
+            if (event["body"].get("metadata") or {}).get("tool_name") == "exec"
+        }
+
+        self.assertEqual(tools["structured"]["result_status"], "error")
+        self.assertEqual(tools["structured"]["exit_code"], 7)
+        self.assertEqual(tools["text"]["result_status"], "unknown")
+        self.assertNotIn("exit_code", tools["text"])
+        self.assertEqual(tools["opaque"]["result_status"], "unknown")
+        self.assertNotIn("exit_code", tools["opaque"])
+        business = next(
+            event["body"]["metadata"] for event in events
+            if (event["body"].get("metadata") or {}).get("tool_id") == "business"
+        )
+        self.assertEqual(business["result_status"], "unknown")
+        self.assertNotIn("exit_code", business)
+
+    def test_mcp_err_result_is_reported_as_error(self):
+        turn_id = "turn-mcp-error"
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "event_msg", "payload": {
+                "type": "mcp_tool_call_end",
+                "call_id": "mcp-error",
+                "invocation": {"server": "github", "tool": "search", "arguments": {}},
+                "result": {"Err": {"content": [{"type": "text", "text": "denied"}]}},
+            }}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id}}, 3),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+        tool = next(
+            event["body"] for event in events
+            if (event["body"].get("metadata") or {}).get("tool_id") == "mcp-error"
+        )
+
+        self.assertEqual(tool["metadata"]["result_status"], "error")
+
 
 class TestEventAssembly(unittest.TestCase):
     def setUp(self):
@@ -139,6 +198,7 @@ class TestEventAssembly(unittest.TestCase):
         span = spans[0]["body"]
         self.assertEqual(span["metadata"]["mcp_tool"], "get_pull_request")
         self.assertEqual(span["metadata"]["tool_name"], "mcp__github__get_pull_request")
+        self.assertEqual(span["metadata"]["result_status"], "success")
         self.assertEqual(json.loads(span["input"])["number"], 42)
         self.assertIn("pull request 42", span["output"])
 

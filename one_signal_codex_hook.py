@@ -581,6 +581,28 @@ def tool_call_output_text(payload: Dict[str, Any]) -> str:
     except Exception:
         return str(out)
 
+COMMAND_TOOL_NAMES = frozenset({"exec", "exec_command", "shell", "shell_command", "write_stdin"})
+
+def tool_call_exit_code(payload: Dict[str, Any]) -> Optional[int]:
+    """Return an exit code only from the tool wrapper's structured output."""
+    out = payload.get("output")
+    structured = out if isinstance(out, dict) else None
+    if structured is None:
+        try:
+            parsed = json.loads(tool_call_output_text(payload))
+            structured = parsed if isinstance(parsed, dict) else None
+        except (json.JSONDecodeError, TypeError):
+            structured = None
+    if structured is not None:
+        code = structured.get("exit_code")
+        if (
+            isinstance(code, int)
+            and not isinstance(code, bool)
+            and abs(code) <= 9_007_199_254_740_991
+        ):
+            return code
+    return None
+
 # ----------------- Incremental reader (byte-safe, mirrors the Claude
 # hook's read_new_jsonl -- see that file's FIX C comment for why splitting
 # on raw b"\n" before decoding is safe) -----------------
@@ -698,6 +720,14 @@ def _mcp_result_text(result: Any) -> str:
                 if text:
                     return text
     return json.dumps(result, ensure_ascii=False) if result is not None else ""
+
+def _mcp_result_status(result: Any) -> str:
+    if isinstance(result, dict):
+        if "Err" in result:
+            return "error"
+        if "Ok" in result:
+            return "success"
+    return "unknown"
 
 def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
     """Groups incremental rollout rows into complete turns. A turn opens at
@@ -825,6 +855,7 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
                     "output_ts": ts,
                     "mcp_server": server,
                     "mcp_tool": tool,
+                    "result_status": _mcp_result_status(payload.get("result")),
                 })
             else:
                 current_round(turn).tool_calls.append({
@@ -836,6 +867,7 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
                     "output_ts": ts,
                     "mcp_server": server,
                     "mcp_tool": tool,
+                    "result_status": _mcp_result_status(payload.get("result")),
                 })
             continue
 
@@ -928,6 +960,13 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
                 _, call = entry
                 call["output"] = tool_call_output_text(payload)
                 call["output_ts"] = ts
+                # Only command tools own process exit codes. Other tools may
+                # legitimately return an unrelated business field with the
+                # same name, which must not become an execution outcome.
+                exit_code = tool_call_exit_code(payload) if call.get("name") in COMMAND_TOOL_NAMES else None
+                if exit_code is not None:
+                    call["exit_code"] = exit_code
+                    call["result_status"] = "success" if exit_code == 0 else "error"
             continue
 
         # Unknown response_item subtype -- ignore.
@@ -1176,6 +1215,8 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                 metadata={
                     "tool_name": tc.get("name"),
                     "tool_id": tc.get("call_id"),
+                    "result_status": tc.get("result_status", "unknown"),
+                    **({"exit_code": tc["exit_code"]} if "exit_code" in tc else {}),
                     **({
                         "mcp_server": tc["mcp_server"],
                         "mcp_tool": tc["mcp_tool"],
