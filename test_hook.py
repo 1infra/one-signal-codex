@@ -385,6 +385,39 @@ class TestSelfTestEntrypoint(unittest.TestCase):
 
 
 class TestStopHookEntrypoint(unittest.TestCase):
+    def test_first_seen_completed_turn_creates_observations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = root / f"rollout-{THREAD_ID}.jsonl"
+            state_dir = root / "state"
+            turn_id = "turn-already-complete"
+            rows = [
+                {"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
+                {"timestamp": "2026-07-12T00:00:01Z", "type": "event_msg", "payload": {"type": "user_message", "message": "hello"}},
+                {"timestamp": "2026-07-12T00:00:03Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id, "last_agent_message": "done"}},
+            ]
+            rollout.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            delivered = []
+
+            with (
+                mock.patch.object(hook, "STATE_DIR", state_dir),
+                mock.patch.object(hook, "STATE_FILE", state_dir / "state.json"),
+                mock.patch.object(hook, "LOCK_FILE", state_dir / "state.lock"),
+                mock.patch.object(hook, "resolve_config", return_value=("https://example.test", "oc_test", None)),
+                mock.patch.object(hook, "deliver", side_effect=lambda events, *_: delivered.extend(events) or {0}),
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": THREAD_ID, "transcript_path": str(rollout)}))),
+            ):
+                hook.main(["one_signal_codex_hook.py"])
+
+            root_span = next(
+                event for event in delivered
+                if event["body"].get("id") == f"{THREAD_ID}-t1-root"
+            )
+            state_entries = [value for key, value in json.loads((state_dir / "state.json").read_text()).items() if key != "_thread_paths"]
+            self.assertEqual(root_span["type"], "observation-create")
+            self.assertLess(root_span["body"]["startTime"], root_span["body"]["endTime"])
+            self.assertEqual(state_entries[0]["partial_turn_ids"], [])
+
     def test_in_progress_turn_uploads_without_advancing_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -394,7 +427,10 @@ class TestStopHookEntrypoint(unittest.TestCase):
             rows = [
                 {"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
                 {"timestamp": "2026-07-12T00:00:01Z", "type": "event_msg", "payload": {"type": "user_message", "message": "hello"}},
-                {"timestamp": "2026-07-12T00:00:02Z", "type": "event_msg", "payload": {"type": "agent_message", "message": "working"}},
+                {"timestamp": "2026-07-12T00:00:02Z", "type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "working"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+                }},
             ]
             rollout.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
             delivered = []
@@ -411,12 +447,19 @@ class TestStopHookEntrypoint(unittest.TestCase):
                 result = hook.main(["one_signal_codex_hook.py"])
 
             trace = next(event for event in delivered if event["type"] == "trace-create")
+            root_span = next(
+                event for event in delivered
+                if event["body"].get("id") == f"{THREAD_ID}-t1-root"
+            )
+            partial_observations = [event for event in delivered if event["type"].startswith("observation-")]
             state_entries = [value for key, value in json.loads((state_dir / "state.json").read_text()).items() if key != "_thread_paths"]
             self.assertEqual(result, 0)
             self.assertEqual(trace["body"]["id"], f"{THREAD_ID}-t1")
             self.assertEqual(trace["body"]["metadata"]["completed"], False)
+            self.assertTrue(all(event["type"] == "observation-create" for event in partial_observations))
             self.assertEqual(state_entries[0]["offset"], 0)
             self.assertEqual(state_entries[0]["turn_count"], 0)
+            self.assertEqual(state_entries[0]["partial_turn_ids"], [turn_id])
 
             complete = {
                 "timestamp": "2026-07-12T00:00:03Z",
@@ -437,11 +480,23 @@ class TestStopHookEntrypoint(unittest.TestCase):
                 hook.main(["one_signal_codex_hook.py"])
 
             final_trace = next(event for event in finalized if event["type"] == "trace-create")
+            final_root_span = next(
+                event for event in finalized
+                if event["body"].get("id") == root_span["body"]["id"]
+            )
+            final_observations = [event for event in finalized if event["type"].startswith("observation-")]
             final_entries = [value for key, value in json.loads((state_dir / "state.json").read_text()).items() if key != "_thread_paths"]
             self.assertEqual(final_trace["body"]["id"], trace["body"]["id"])
             self.assertEqual(final_trace["body"]["metadata"]["completed"], True)
+            self.assertEqual(
+                {event["body"]["id"] for event in final_observations},
+                {event["body"]["id"] for event in partial_observations},
+            )
+            self.assertTrue(all(event["type"] == "observation-update" for event in final_observations))
+            self.assertLess(final_root_span["body"]["startTime"], final_root_span["body"]["endTime"])
             self.assertGreater(final_entries[0]["offset"], 0)
             self.assertEqual(final_entries[0]["turn_count"], 1)
+            self.assertEqual(final_entries[0]["partial_turn_ids"], [])
 
 
 if __name__ == "__main__":

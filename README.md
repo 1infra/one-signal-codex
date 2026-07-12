@@ -128,9 +128,9 @@ neither. State (byte offset + turn count per session) lives under
   idempotent upserts, not duplicates.
 - **Stop-hook timing:** Codex fires `Stop` before appending `task_complete`.
   Like Langfuse's plugin, this hook uploads the in-progress trace immediately
-  without advancing the checkpoint; a later Stop overwrites the same
-  deterministic IDs with the completed version. Interrupted turns are
-  finalized with `aborted: true`.
+  without advancing the checkpoint; a later Stop updates the same deterministic
+  observation IDs with the completed timestamps and output. Interrupted turns
+  are finalized with `aborted: true`.
 - **Transient delivery failures:** network errors, HTTP 429, and HTTP 5xx are
   retried up to three times inside the same Hook run. The checkpoint advances
   only after every event for a completed turn is accepted upstream.

@@ -1053,16 +1053,17 @@ def _trace_create(*, trace_id: str, name: str, user_id: Optional[str], session_i
         "tags": tags,
     })
 
-def _observation_create(*, obs_id: str, trace_id: str, parent_id: Optional[str], obs_type: str,
+def _observation_event(*, obs_id: str, trace_id: str, parent_id: Optional[str], obs_type: str,
                          name: str, start_time: Optional[datetime], end_time: Optional[datetime],
                          input_: Any = None, output: Any = None, model: Optional[str] = None,
                          usage_details: Optional[Dict[str, int]] = None,
-                         metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    return _event_envelope("observation-create", {
+                         metadata: Optional[Dict[str, Any]] = None,
+                         event_type: str = "observation-create") -> Dict[str, Any]:
+    return _event_envelope(event_type, {
         "id": obs_id,
         "traceId": trace_id,
         "parentObservationId": parent_id,
-        # Classic ingestion's observation-create `type` only accepts
+        # Classic ingestion's legacy observation `type` only accepts
         # GENERATION | SPAN | EVENT -- callers below never pass anything
         # else (same constraint as ../one-signal; a "TOOL" type is
         # silently rejected inside the batch's per-event 207 response).
@@ -1112,7 +1113,8 @@ def usage_details_from_token_count(info_blob: Optional[Dict[str, Any]]) -> Optio
     return details or None
 
 def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: Path,
-                       user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+                       user_id: Optional[str] = None,
+                       update_observations: bool = False) -> List[Dict[str, Any]]:
     """Builds the ingestion-batch events for one turn: trace-create, root
     SPAN, one GENERATION per model round (+ nested tool SPANs and reasoning
     EVENTs)."""
@@ -1156,6 +1158,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
 
     trace_id = f"{thread_id}-t{turn_num}"
     root_obs_id = f"{trace_id}-root"
+    observation_event_type = "observation-update" if update_observations else "observation-create"
 
     events.append(_trace_create(
         trace_id=trace_id,
@@ -1168,7 +1171,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
         tags=tags,
         timestamp=turn.user_ts,
     ))
-    events.append(_observation_create(
+    events.append(_observation_event(
         obs_id=root_obs_id,
         trace_id=trace_id,
         parent_id=None,
@@ -1179,6 +1182,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
         input_={"role": "user", "content": user_text},
         output={"role": "assistant", "content": final_text},
         metadata=turn_metadata,
+        event_type=observation_event_type,
     ))
 
     prev_ts = turn.user_ts
@@ -1204,7 +1208,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                 end_candidates.append(tc["output_ts"])
         gen_end_ts = max(end_candidates) if end_candidates else prev_ts
 
-        events.append(_observation_create(
+        events.append(_observation_event(
             obs_id=gen_id,
             trace_id=trace_id,
             parent_id=root_obs_id,
@@ -1222,6 +1226,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                 "tool_count": len(rnd.tool_calls),
                 "has_reasoning": rnd.reasoning is not None,
             },
+            event_type=observation_event_type,
         ))
 
         if rnd.reasoning is not None:
@@ -1230,7 +1235,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
             # build/config (both observed against real rollouts) --
             # extract_text() handles either shape.
             summary_text = extract_text(rnd.reasoning.get("summary")) or None
-            events.append(_observation_create(
+            events.append(_observation_event(
                 obs_id=f"{gen_id}-reasoning",
                 trace_id=trace_id,
                 parent_id=gen_id,
@@ -1245,6 +1250,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                     "has_encrypted_content": bool(rnd.reasoning.get("encrypted_content")),
                     "reasoning_id": rnd.reasoning.get("id"),
                 },
+                event_type=observation_event_type,
             ))
 
         for t_idx, tc in enumerate(rnd.tool_calls):
@@ -1252,7 +1258,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                 tc.get("input") if isinstance(tc.get("input"), str) else json.dumps(tc.get("input"), ensure_ascii=False) if tc.get("input") is not None else None
             )
             toutput, toutput_meta = truncate_text(tc.get("output"))
-            events.append(_observation_create(
+            events.append(_observation_event(
                 obs_id=f"{gen_id}-tool{t_idx + 1}",
                 trace_id=trace_id,
                 parent_id=gen_id,
@@ -1274,6 +1280,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                     "input_meta": tinput_meta,
                     "output_meta": toutput_meta,
                 },
+                event_type=observation_event_type,
             ))
 
         prev_ts = gen_end_ts or prev_ts
@@ -1479,6 +1486,13 @@ def main(argv: List[str]) -> int:
             entry = state.get(key, {})
             offset = int(entry.get("offset", 0))
             turn_count = int(entry.get("turn_count", 0))
+            # Incomplete turns deliberately keep the same transcript offset.
+            # Remember accepted partials separately so their stable observation
+            # IDs are updated, not created again, when the turn completes.
+            partial_turn_ids = {
+                turn_id for turn_id in entry.get("partial_turn_ids", [])
+                if isinstance(turn_id, str)
+            }
 
             rows = read_new_lines(rollout_path, offset)
             if not rows:
@@ -1497,7 +1511,14 @@ def main(argv: List[str]) -> int:
             for i, t in enumerate(turns):
                 turn_num = turn_count + i + 1
                 try:
-                    turn_events = build_turn_events(thread_id, turn_num, t, rollout_path, user_id=user_id)
+                    turn_events = build_turn_events(
+                        thread_id,
+                        turn_num,
+                        t,
+                        rollout_path,
+                        user_id=user_id,
+                        update_observations=t.turn_id in partial_turn_ids,
+                    )
                 except Exception as e:
                     info(f"build_turn_events failed: {type(e).__name__}: {e}")
                     turn_events = []
@@ -1506,6 +1527,13 @@ def main(argv: List[str]) -> int:
 
             total_events = len(events)
             accepted_idx = deliver(events, event_turn_idx, base_url, api_token) if events else set()
+
+            for i, turn in enumerate(turns):
+                if i in accepted_idx:
+                    if turn.complete:
+                        partial_turn_ids.discard(turn.turn_id)
+                    else:
+                        partial_turn_ids.add(turn.turn_id)
 
             for i in range(len(turns)):
                 if turns[i].complete and i in accepted_idx:
@@ -1526,6 +1554,7 @@ def main(argv: List[str]) -> int:
             state[key] = {
                 "offset": offset,
                 "turn_count": turn_count,
+                "partial_turn_ids": sorted(partial_turn_ids),
                 "updated": datetime.now(timezone.utc).isoformat(),
             }
             save_state(state)
