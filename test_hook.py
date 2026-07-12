@@ -48,6 +48,27 @@ class TestParsingPipeline(unittest.TestCase):
         turn = self.turns[0]
         self.assertEqual(turn.last_agent_message, "Done, printed hi")
 
+    def test_user_quoting_skill_markup_is_not_an_invocation(self):
+        turn_id = "turn-quoted-skill"
+        prompt = "Explain <skill><name>not-invoked</name></skill>"
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "event_msg", "payload": {"type": "user_message", "message": prompt}}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "response_item", "payload": {
+                "type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+            }}, 3),
+            ({"timestamp": "2026-07-12T00:00:03Z", "type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": turn_id, "last_agent_message": "Explained",
+            }}, 4),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+        trace = next(event for event in events if event["type"] == "trace-create")
+
+        self.assertNotIn("skill_names", trace["body"]["metadata"])
+
 
 class TestEventAssembly(unittest.TestCase):
     def setUp(self):
@@ -92,8 +113,7 @@ class TestEventAssembly(unittest.TestCase):
             e for e in self._observations_by_body_type("SPAN")
             if "tool_name" in (e["body"].get("metadata") or {})
         ]
-        self.assertEqual(len(tool_spans), 1)
-        span = tool_spans[0]
+        span = next(s for s in tool_spans if s["body"]["metadata"]["tool_name"] == "shell")
         self.assertEqual(span["body"]["metadata"]["tool_name"], "shell")
         self.assertEqual(span["body"]["metadata"]["tool_id"], "call_fixture_1")
         self.assertIn("hi", span["body"]["output"])
@@ -101,6 +121,29 @@ class TestEventAssembly(unittest.TestCase):
         # GENERATION | SPAN | EVENT -- a literal "TOOL" type would be
         # silently rejected by the real ingest endpoint.
         self.assertIn(span["body"]["type"], ("GENERATION", "SPAN", "EVENT"))
+
+    def test_skill_injection_is_aggregated_on_trace(self):
+        trace = self._by_type("trace-create")[0]
+        self.assertEqual(trace["body"]["metadata"]["skill_names"], [
+            "code-review", "tdd", "implement", "codebase-design",
+        ])
+        self.assertIn("skill:code-review", trace["body"]["tags"])
+        self.assertNotIn("skill:not-invoked", trace["body"]["tags"])
+
+    def test_mcp_call_is_emitted_as_attributed_tool_span(self):
+        spans = [
+            e for e in self._observations_by_body_type("SPAN")
+            if (e["body"].get("metadata") or {}).get("mcp_server") == "github"
+        ]
+        self.assertEqual(len(spans), 1)
+        span = spans[0]["body"]
+        self.assertEqual(span["metadata"]["mcp_tool"], "get_pull_request")
+        self.assertEqual(span["metadata"]["tool_name"], "mcp__github__get_pull_request")
+        self.assertEqual(json.loads(span["input"])["number"], 42)
+        self.assertIn("pull request 42", span["output"])
+
+        trace = self._by_type("trace-create")[0]["body"]
+        self.assertIn("mcp:github:get_pull_request", trace["tags"])
 
     def test_reasoning_event_present_without_leaking_ciphertext(self):
         reasoning_events = [

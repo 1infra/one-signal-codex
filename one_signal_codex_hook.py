@@ -138,6 +138,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -532,6 +533,7 @@ class Turn:
     completed_ts: Optional[datetime] = None
     duration_ms: Optional[int] = None
     rounds: List[TurnRound] = field(default_factory=list)
+    skills: List[str] = field(default_factory=list)
     complete: bool = False
 
 def _normalize_tool_call(payload: Dict[str, Any], ts: Optional[datetime]) -> Dict[str, Any]:
@@ -543,6 +545,42 @@ def _normalize_tool_call(payload: Dict[str, Any], ts: Optional[datetime]) -> Dic
         "output": None,
         "output_ts": None,
     }
+
+def _skill_name_from_text(text: str) -> Optional[str]:
+    patterns = (
+        r"<skill>\s*<name>\s*([^<\s][^<]*?)\s*</name>",
+        r"<command-name>\s*/([^<\s]+)\s*</command-name>",
+        r"Base directory for this skill:\s*([^\n\r]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        value = match.group(1).strip().rstrip("/\\")
+        return value.replace("\\", "/").split("/")[-1]
+    return None
+
+def _skill_name_from_payload(payload: Dict[str, Any]) -> Optional[str]:
+    name = _skill_name_from_text(extract_text(payload.get("content")))
+    if name:
+        return name
+    if "skill" not in str(payload.get("type") or "").lower():
+        return None
+    for key in ("name", "skill", "skill_name", "skillName"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+def _mcp_result_text(result: Any) -> str:
+    if isinstance(result, dict):
+        for status in ("Ok", "Err"):
+            value = result.get(status)
+            if isinstance(value, dict) and "content" in value:
+                text = extract_text(value["content"])
+                if text:
+                    return text
+    return json.dumps(result, ensure_ascii=False) if result is not None else ""
 
 def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
     """Groups incremental rollout rows into complete turns. A turn opens at
@@ -584,6 +622,16 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
         payload = row.get("payload")
         if not isinstance(payload, dict):
             continue
+
+        payload_type = str(payload.get("type") or "")
+        if "skill" in payload_type.lower():
+            tid = payload.get("turn_id") or row_turn_id(payload)
+            turn = open_turns.get(tid) if isinstance(tid, str) else None
+            if turn is None and len(open_turns) == 1:
+                turn = next(iter(open_turns.values()))
+            skill = _skill_name_from_payload(payload)
+            if turn and skill and skill not in turn.skills:
+                turn.skills.append(skill)
 
         if row_type == "event_msg" and payload.get("type") == "task_started":
             tid = payload.get("turn_id")
@@ -638,6 +686,42 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
                     pending_usage.setdefault(tid, []).append((info_blob, ts))
             continue
 
+        if row_type == "event_msg" and payload.get("type") == "mcp_tool_call_end":
+            invocation = payload.get("invocation")
+            if not isinstance(invocation, dict):
+                continue
+            server = invocation.get("server")
+            tool = invocation.get("tool")
+            if not isinstance(server, str) or not isinstance(tool, str) or not open_turns:
+                continue
+            # Codex does not put turn_id on this event. Rollouts are sequential,
+            # so the only open turn is the owning turn.
+            turn = next(iter(open_turns.values()))
+            ts = parse_timestamp(row.get("timestamp"))
+            call_id = payload.get("call_id")
+            entry = pending_tool_calls.get(turn.turn_id, {}).get(str(call_id))
+            if entry:
+                call = entry[1]
+                call.update({
+                    "name": f"mcp__{server}__{tool}",
+                    "output": _mcp_result_text(payload.get("result")),
+                    "output_ts": ts,
+                    "mcp_server": server,
+                    "mcp_tool": tool,
+                })
+            else:
+                current_round(turn).tool_calls.append({
+                    "call_id": call_id,
+                    "name": f"mcp__{server}__{tool}",
+                    "input": invocation.get("arguments"),
+                    "ts": ts,
+                    "output": _mcp_result_text(payload.get("result")),
+                    "output_ts": ts,
+                    "mcp_server": server,
+                    "mcp_tool": tool,
+                })
+            continue
+
         if row_type == "event_msg" and payload.get("type") == "task_complete":
             tid = payload.get("turn_id")
             turn = open_turns.pop(tid, None) if isinstance(tid, str) else None
@@ -659,6 +743,9 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
 
         item_type = payload.get("type")
 
+        if isinstance(item_type, str) and "skill" in item_type.lower():
+            continue
+
         if item_type == "message":
             tid = row_turn_id(payload)
             if not tid or tid not in open_turns:
@@ -667,6 +754,11 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
             role = payload.get("role")
             text = extract_text(payload.get("content"))
             ts = parse_timestamp(row.get("timestamp"))
+            # Codex injects resolved Skill content as an additional user-role
+            # message. Do not classify the real prompt or assistant examples.
+            skill = _skill_name_from_payload(payload) if role == "user" and text != turn.user_text else None
+            if skill and skill not in turn.skills:
+                turn.skills.append(skill)
             if role == "user" and not turn.user_text_authoritative:
                 # Fallback only: response_item/message role=user rows can
                 # be injected context (e.g. <recommended_plugins>) rather
@@ -843,7 +935,18 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
     if turn.duration_ms is not None:
         turn_metadata["duration_ms"] = turn.duration_ms
 
-    tags = ["codex-cli"]
+    if turn.skills:
+        turn_metadata["skill_names"] = turn.skills
+    mcp_tools = [
+        {"server": tc["mcp_server"], "tool": tc["mcp_tool"]}
+        for rnd in turn.rounds for tc in rnd.tool_calls
+        if tc.get("mcp_server") and tc.get("mcp_tool")
+    ]
+    tags = list(dict.fromkeys([
+        "codex-cli",
+        *[f"skill:{name}" for name in turn.skills],
+        *[f"mcp:{item['server']}:{item['tool']}" for item in mcp_tools],
+    ]))
 
     trace_id = f"{thread_id}-t{turn_num}"
     root_obs_id = f"{trace_id}-root"
@@ -956,6 +1059,10 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                 metadata={
                     "tool_name": tc.get("name"),
                     "tool_id": tc.get("call_id"),
+                    **({
+                        "mcp_server": tc["mcp_server"],
+                        "mcp_tool": tc["mcp_tool"],
+                    } if tc.get("mcp_server") and tc.get("mcp_tool") else {}),
                     "input_meta": tinput_meta,
                     "output_meta": toutput_meta,
                 },
