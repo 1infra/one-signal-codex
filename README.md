@@ -35,27 +35,13 @@ Replace `oc_xxx` with your One Connector access token. That's it — start a
 new `codex` session (or run `codex exec "..."`) and your turns show up in
 **Console → Observe**.
 
-Codex 0.128–0.143 supports hooks and marketplace registration but may not
-expose `codex plugin add`. On those versions, replace the second command by
-adding this to `~/.codex/config.toml`, matching Langfuse's compatibility
-instructions:
-
-```toml
-[features]
-plugin_hooks = true
-
-[plugins."one-signal-codex@one-infra"]
-enabled = true
-```
-
 - **Line 1** registers this repo as a Codex plugin marketplace (Codex reads
   `.agents/plugins/marketplace.json` at the repo root).
 - **Line 2** installs and enables the plugin. It writes
   `[plugins."one-signal-codex@one-infra"] enabled = true` to
   `~/.codex/config.toml` for you. The plugin's Stop hook runs under Codex's
   **stable `hooks` feature** — on Codex 0.144.1 no extra feature flag is
-  needed (the old `plugin_hooks` flag is removed; see
-  [Requirements](#requirements) for older builds).
+  needed.
 - **Line 3** stores your token where the hook reads it (chmod 600). You can
   use an environment variable instead — see [Configure](#configure).
 
@@ -98,48 +84,12 @@ export ONE_SIGNAL_API_TOKEN="oc_xxx"   # add to ~/.zshrc / ~/.bashrc to persist
 
 ## Requirements
 
-- **Codex CLI ≥ 0.128** — plugin hooks were introduced here. Codex 0.144+
-  includes the `codex plugin add` command used above and enables hooks by
-  default. Check yours with
+- **Codex CLI ≥ 0.144** — this includes the `codex plugin add` command used
+  above and enables hooks by default. Check yours with
   `codex --version` and `codex features list` (look for `hooks … stable …
   true`).
-- **Older builds** where `hooks` isn't stable/default-on may need plugin
-  hooks explicitly enabled in `~/.codex/config.toml`:
-
-  ```toml
-  [features]
-  hooks = true          # or, on those builds, plugin_hooks = true
-  ```
-
-  On 0.144.1 the `plugin_hooks` flag is **removed** and setting it is a no-op
-  (the Stop hook fires even with `plugin_hooks=false`).
 - **Python 3.10+** as `python3` on your `PATH` (the Stop hook is a `python3`
   command). No third-party packages — pure standard library.
-
-## Manual install (alternative)
-
-If you have this repo checked out and would rather use the legacy `notify`
-wiring instead of the plugin marketplace:
-
-```bash
-python3 install.py --token oc_xxx
-```
-
-This writes `~/.codex/one-signal.json` (chmod 600) and adds a `notify`
-entry to `~/.codex/config.toml` pointing at the hook script.
-
-| Flag | Description |
-| --- | --- |
-| `--token` | Your One Connector access token (`oc_...`). Required. |
-| `--base-url` | Your One Connector deployment URL. Default `https://connector.1infra.io`. |
-| `--user-id` | Optional. User identifier attached to every trace. |
-| `--uninstall` | Removes the `notify` wiring from `config.toml`. Leaves `one-signal.json` in place. |
-
-Codex only runs **one** `notify` command, so if `config.toml` already has a
-different `notify` configured (e.g. another integration), the installer
-refuses to overwrite it and prints wrapper-chaining instructions. **The
-marketplace path above has no such conflict** — plugin Stop hooks don't
-compete for the single `notify` slot, which is the main reason to prefer it.
 
 ## How it works
 
