@@ -142,6 +142,13 @@ captured as a lightweight event. The batch is POSTed to
 `<ONE_SIGNAL_BASE_URL>/api/v1/observe/ingest`, identically to the Claude
 Code plugin.
 
+Each turn is also attributed, matching the Claude Code plugin's tags so both
+sources filter alike in Console → Observe: skills invoked in the turn
+(detected from Codex's injected `<skill><name>…</name>` preamble) become
+`skill:<name>` trace tags plus a `skill_names` metadata list, and MCP tool
+calls become `mcp:<server>:<tool>` trace tags with `mcp_server` / `mcp_tool`
+recorded on that tool's span metadata.
+
 The same hook script also accepts the legacy `notify` argv payload (thread
 id, no transcript path — it globs `sessions/**/*-<thread-id>.jsonl`), and
 falls back to the newest rollout on disk if a payload variant carries
@@ -203,9 +210,9 @@ via `ONE_SIGNAL_CODEX_MAX_CHARS`.
 ## Self-test
 
 ```bash
-python3 plugins/one-signal-codex/test_hook.py -v
+uv run python plugins/one-signal-codex/test_hook.py -v
 # or
-python3 plugins/one-signal-codex/one_signal_codex_hook.py --self-test
+uv run python plugins/one-signal-codex/one_signal_codex_hook.py --self-test
 ```
 
 Runs the parser/assembly pipeline against a bundled fixture rollout

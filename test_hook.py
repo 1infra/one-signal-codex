@@ -7,13 +7,13 @@ parsing/assembly pipeline and asserts the resulting Langfuse batch shape,
 entirely offline (no network calls). This is a thin unittest wrapper around
 `one_signal_codex_hook.run_self_test()`, which is also runnable directly:
 
-    python3 one_signal_codex_hook.py --self-test
+    uv run python one_signal_codex_hook.py --self-test
 
 Run this file with:
 
-    python3 test_hook.py
+    uv run python test_hook.py
     # or
-    python3 -m unittest test_hook -v
+    uv run python -m unittest test_hook -v
 """
 
 import json
@@ -49,15 +49,19 @@ class TestParsingPipeline(unittest.TestCase):
         self.assertEqual(turn.last_agent_message, "Done, printed hi")
 
     def test_user_quoting_skill_markup_is_not_an_invocation(self):
+        # Uses the real rollout ordering: Codex emits the user-role
+        # response_item copy of the prompt BEFORE the authoritative
+        # event_msg/user_message. A prompt that merely quotes skill markup
+        # mid-sentence must not be classified as a skill invocation.
         turn_id = "turn-quoted-skill"
         prompt = "Explain <skill><name>not-invoked</name></skill>"
         rows = [
             ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
-            ({"timestamp": "2026-07-12T00:00:01Z", "type": "event_msg", "payload": {"type": "user_message", "message": prompt}}, 2),
-            ({"timestamp": "2026-07-12T00:00:02Z", "type": "response_item", "payload": {
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "response_item", "payload": {
                 "type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}],
                 "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
-            }}, 3),
+            }}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "event_msg", "payload": {"type": "user_message", "message": prompt}}, 3),
             ({"timestamp": "2026-07-12T00:00:03Z", "type": "event_msg", "payload": {
                 "type": "task_complete", "turn_id": turn_id, "last_agent_message": "Explained",
             }}, 4),
@@ -68,6 +72,55 @@ class TestParsingPipeline(unittest.TestCase):
         trace = next(event for event in events if event["type"] == "trace-create")
 
         self.assertNotIn("skill_names", trace["body"]["metadata"])
+
+    def test_user_prompt_starting_with_skill_markup_is_not_an_invocation(self):
+        turn_id = "turn-prompt-starts-with-skill"
+        prompt = "<skill><name>user-text</name></skill> please explain"
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "response_item", "payload": {
+                "type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+            }}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "event_msg", "payload": {"type": "user_message", "message": prompt}}, 3),
+            ({"timestamp": "2026-07-12T00:00:03Z", "type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": turn_id, "last_agent_message": "Explained",
+            }}, 4),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+        trace = next(event for event in events if event["type"] == "trace-create")
+
+        self.assertNotIn("skill_names", trace["body"]["metadata"])
+
+    def test_real_skill_injection_before_authoritative_prompt_is_detected(self):
+        # In most real rollouts, the Skill injection arrives before the
+        # authoritative event_msg/user_message.
+        turn_id = "turn-real-skill"
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "response_item", "payload": {
+                "type": "message", "role": "user", "content": [{"type": "input_text", "text": "review my change"}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+            }}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "<skill>\n<name>code-review</name>\n</skill>\nfull skill body here"}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+            }}, 3),
+            ({"timestamp": "2026-07-12T00:00:03Z", "type": "event_msg", "payload": {"type": "user_message", "message": "review my change"}}, 4),
+            ({"timestamp": "2026-07-12T00:00:04Z", "type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": turn_id, "last_agent_message": "Reviewed",
+            }}, 5),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+        trace = next(event for event in events if event["type"] == "trace-create")
+
+        self.assertEqual(trace["body"]["metadata"]["skill_names"], ["code-review"])
+        self.assertIn("skill:code-review", trace["body"]["tags"])
 
     def test_tool_outputs_only_report_reliable_exit_codes(self):
         turn_id = "turn-tool-outcomes"
@@ -172,8 +225,10 @@ class TestEventAssembly(unittest.TestCase):
             e for e in self._observations_by_body_type("SPAN")
             if "tool_name" in (e["body"].get("metadata") or {})
         ]
+        # The fixture yields exactly two tool spans: the shell call and the
+        # MCP call. An exact count guards against duplicate or orphan spans.
+        self.assertEqual(len(tool_spans), 2)
         span = next(s for s in tool_spans if s["body"]["metadata"]["tool_name"] == "shell")
-        self.assertEqual(span["body"]["metadata"]["tool_name"], "shell")
         self.assertEqual(span["body"]["metadata"]["tool_id"], "call_fixture_1")
         self.assertIn("hi", span["body"]["output"])
         # Classic ingestion's observation-create only accepts
@@ -183,10 +238,10 @@ class TestEventAssembly(unittest.TestCase):
 
     def test_skill_injection_is_aggregated_on_trace(self):
         trace = self._by_type("trace-create")[0]
-        self.assertEqual(trace["body"]["metadata"]["skill_names"], [
-            "code-review", "tdd", "implement", "codebase-design",
-        ])
+        self.assertEqual(trace["body"]["metadata"]["skill_names"], ["code-review"])
         self.assertIn("skill:code-review", trace["body"]["tags"])
+        # The assistant-role message that merely quotes `<skill><name>...`
+        # markup must never be counted as an invocation.
         self.assertNotIn("skill:not-invoked", trace["body"]["tags"])
 
     def test_mcp_call_is_emitted_as_attributed_tool_span(self):
@@ -204,6 +259,42 @@ class TestEventAssembly(unittest.TestCase):
 
         trace = self._by_type("trace-create")[0]["body"]
         self.assertIn("mcp:github:get_pull_request", trace["tags"])
+
+    def test_mcp_call_without_paired_function_call_is_recovered(self):
+        # Fallback path: an mcp_tool_call_end with no preceding function_call
+        # (dict arguments, an Err result) must still yield one attributed SPAN
+        # whose input is JSON-parseable, whose output carries the error text,
+        # and whose latency is recovered from the event's `duration` rather
+        # than collapsed to zero.
+        turn_id = "turn-orphan-mcp"
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00.000Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:00.100Z", "type": "event_msg", "payload": {"type": "user_message", "message": "search it"}}, 2),
+            ({"timestamp": "2026-07-12T00:00:02.000Z", "type": "event_msg", "payload": {
+                "type": "mcp_tool_call_end",
+                "call_id": "call_orphan_1",
+                "invocation": {"server": "exa", "tool": "web_search", "arguments": {"query": "hi"}},
+                "duration": {"secs": 1, "nanos": 500000000},
+                "result": {"Err": {"content": [{"type": "text", "text": "rate limited"}]}},
+            }}, 3),
+            ({"timestamp": "2026-07-12T00:00:02.100Z", "type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": turn_id, "last_agent_message": "done",
+            }}, 4),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+        spans = [
+            e for e in events
+            if e["body"].get("type") == "SPAN" and (e["body"].get("metadata") or {}).get("mcp_server") == "exa"
+        ]
+        self.assertEqual(len(spans), 1)
+        body = spans[0]["body"]
+        self.assertEqual(body["metadata"]["mcp_tool"], "web_search")
+        self.assertEqual(json.loads(body["input"])["query"], "hi")
+        self.assertIn("rate limited", body["output"])
+        # Start = end (00:02.000) minus 1.5s duration = 00:00.500, not zero-width.
+        self.assertLess(body["startTime"], body["endTime"])
 
     def test_reasoning_event_present_without_leaking_ciphertext(self):
         reasoning_events = [

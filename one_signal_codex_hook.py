@@ -95,6 +95,14 @@ payload's `thread-id` and the file's own first line,
                                      incremental usage for the model call
                                      that just returned; no turn_id field,
                                      attributed positionally)
+  - `event_msg` / `mcp_tool_call_end`  (payload.invocation.server/tool,
+                                     payload.result, payload.duration -- an
+                                     MCP tool call's completion; no turn_id
+                                     field, attributed positionally to the
+                                     most recently opened turn. Pairs with a
+                                     preceding function_call by call_id when
+                                     present, otherwise emitted as its own
+                                     attributed span)
   - `response_item` / `message`    (role user/assistant/developer; content
                                      blocks type `input_text`/`output_text`;
                                      carries
@@ -103,7 +111,11 @@ payload's `thread-id` and the file's own first line,
                                      absent on injected system/developer
                                      preamble, which this hook treats as
                                      noise and skips, mirroring how the
-                                     Claude hook skips `isMeta` rows)
+                                     Claude hook skips `isMeta` rows. A
+                                     user-role message whose text BEGINS with
+                                     the `<skill><name>...` preamble is a
+                                     skill injection and is recorded as
+                                     turn attribution -- see _SKILL_MARKER)
   - `response_item` / `reasoning`  (payload.summary: list[str], usually
                                      empty unless reasoning summaries are
                                      enabled; payload.encrypted_content is
@@ -673,6 +685,7 @@ class Turn:
     duration_ms: Optional[int] = None
     rounds: List[TurnRound] = field(default_factory=list)
     skills: List[str] = field(default_factory=list)
+    pending_skills: List[Tuple[str, str]] = field(default_factory=list)
     complete: bool = False
 
 def _normalize_tool_call(payload: Dict[str, Any], ts: Optional[datetime]) -> Dict[str, Any]:
@@ -685,31 +698,31 @@ def _normalize_tool_call(payload: Dict[str, Any], ts: Optional[datetime]) -> Dic
         "output_ts": None,
     }
 
+# When a Codex turn invokes a skill, the CLI injects the skill's resolved
+# content as an extra user-role response_item whose text BEGINS with the
+# literal preamble `<skill>\n<name>NAME</name>...`. Anchored to the start of
+# the (stripped) message on purpose: across 802/802 real skill injections in
+# local rollouts every one starts with this marker, never mid-text, so
+# anchoring is what distinguishes a genuine injection from a user prompt that
+# merely quotes the markup ("Explain <skill>..."). Skill names are short
+# slugs; the cap bounds an adversarial or malformed injection so it cannot
+# mint an oversized trace tag (the server independently re-caps on read).
+_SKILL_MARKER = re.compile(r"^\s*<skill>\s*<name>\s*([^<\s][^<]*?)\s*</name>", re.IGNORECASE)
+MAX_SKILL_NAME_CHARS = 128
+MAX_SKILLS_PER_TURN = 100
+
 def _skill_name_from_text(text: str) -> Optional[str]:
-    patterns = (
-        r"<skill>\s*<name>\s*([^<\s][^<]*?)\s*</name>",
-        r"<command-name>\s*/([^<\s]+)\s*</command-name>",
-        r"Base directory for this skill:\s*([^\n\r]+)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if not match:
-            continue
-        value = match.group(1).strip().rstrip("/\\")
-        return value.replace("\\", "/").split("/")[-1]
-    return None
+    match = _SKILL_MARKER.match(text or "")
+    if not match:
+        return None
+    return match.group(1).strip()[:MAX_SKILL_NAME_CHARS] or None
 
 def _skill_name_from_payload(payload: Dict[str, Any]) -> Optional[str]:
-    name = _skill_name_from_text(extract_text(payload.get("content")))
-    if name:
-        return name
-    if "skill" not in str(payload.get("type") or "").lower():
-        return None
-    for key in ("name", "skill", "skill_name", "skillName"):
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
+    return _skill_name_from_text(extract_text(payload.get("content")))
+
+def _record_skill(turn: Turn, skill: str) -> None:
+    if skill not in turn.skills and len(turn.skills) < MAX_SKILLS_PER_TURN:
+        turn.skills.append(skill)
 
 def _mcp_result_text(result: Any) -> str:
     if isinstance(result, dict):
@@ -728,6 +741,19 @@ def _mcp_result_status(result: Any) -> str:
         if "Ok" in result:
             return "success"
     return "unknown"
+
+def _mcp_start_ts(end_ts: Optional[datetime], duration: Any) -> Optional[datetime]:
+    """Recover a span start time from mcp_tool_call_end's own end time and its
+    reported `{"secs": ..., "nanos": ...}` duration, so a synthesized MCP span
+    (no paired function_call to supply a start) reports real latency instead
+    of collapsing to zero."""
+    if end_ts is None or not isinstance(duration, dict):
+        return end_ts
+    secs = duration.get("secs")
+    nanos = duration.get("nanos")
+    if not isinstance(secs, (int, float)) or not isinstance(nanos, (int, float)):
+        return end_ts
+    return end_ts - timedelta(seconds=secs, microseconds=nanos / 1000)
 
 def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
     """Groups incremental rollout rows into complete turns. A turn opens at
@@ -770,16 +796,6 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
         if not isinstance(payload, dict):
             continue
 
-        payload_type = str(payload.get("type") or "")
-        if "skill" in payload_type.lower():
-            tid = payload.get("turn_id") or row_turn_id(payload)
-            turn = open_turns.get(tid) if isinstance(tid, str) else None
-            if turn is None and len(open_turns) == 1:
-                turn = next(iter(open_turns.values()))
-            skill = _skill_name_from_payload(payload)
-            if turn and skill and skill not in turn.skills:
-                turn.skills.append(skill)
-
         if row_type == "event_msg" and payload.get("type") == "task_started":
             tid = payload.get("turn_id")
             if not isinstance(tid, str) or not tid:
@@ -814,11 +830,17 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
             ts = parse_timestamp(row.get("timestamp"))
             msg = payload.get("message")
             if isinstance(msg, str) and open_turns:
-                for tid in open_turns:
-                    turn = open_turns[tid]
-                    turn.user_text = msg
-                    turn.user_ts = ts
-                    turn.user_text_authoritative = True
+                # Like MCP completion events, user_message has no turn_id.
+                # It belongs to the most recently started turn; older open
+                # turns are interrupted/incomplete turns retained for retry.
+                turn = list(open_turns.values())[-1]
+                turn.user_text = msg
+                turn.user_ts = ts
+                turn.user_text_authoritative = True
+                for candidate_text, skill in turn.pending_skills:
+                    if candidate_text != msg:
+                        _record_skill(turn, skill)
+                turn.pending_skills.clear()
             continue
 
         if row_type == "event_msg" and payload.get("type") == "token_count":
@@ -841,10 +863,13 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
             tool = invocation.get("tool")
             if not isinstance(server, str) or not isinstance(tool, str) or not open_turns:
                 continue
-            # Codex does not put turn_id on this event. Rollouts are sequential,
-            # so the only open turn is the owning turn.
-            turn = next(iter(open_turns.values()))
-            ts = parse_timestamp(row.get("timestamp"))
+            # This event carries no turn_id, so it is attributed positionally.
+            # A turn that ends without task_complete (e.g. an interrupted turn
+            # whose task_complete is not in this read) stays in open_turns, so
+            # more than one turn can be open at once; the MCP call belongs to
+            # the most recently started turn, not the oldest.
+            turn = list(open_turns.values())[-1]
+            end_ts = parse_timestamp(row.get("timestamp"))
             call_id = payload.get("call_id")
             entry = pending_tool_calls.get(turn.turn_id, {}).get(str(call_id))
             if entry:
@@ -852,19 +877,24 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
                 call.update({
                     "name": f"mcp__{server}__{tool}",
                     "output": _mcp_result_text(payload.get("result")),
-                    "output_ts": ts,
+                    "output_ts": end_ts,
                     "mcp_server": server,
                     "mcp_tool": tool,
                     "result_status": _mcp_result_status(payload.get("result")),
                 })
             else:
+                # No paired function_call was seen for this call_id, so there
+                # is no start timestamp on record. Recover the span's start
+                # from the event's own end time minus its reported duration
+                # (rather than collapsing the span to zero latency).
+                start_ts = _mcp_start_ts(end_ts, payload.get("duration"))
                 current_round(turn).tool_calls.append({
                     "call_id": call_id,
                     "name": f"mcp__{server}__{tool}",
                     "input": invocation.get("arguments"),
-                    "ts": ts,
+                    "ts": start_ts,
                     "output": _mcp_result_text(payload.get("result")),
-                    "output_ts": ts,
+                    "output_ts": end_ts,
                     "mcp_server": server,
                     "mcp_tool": tool,
                     "result_status": _mcp_result_status(payload.get("result")),
@@ -892,9 +922,6 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
 
         item_type = payload.get("type")
 
-        if isinstance(item_type, str) and "skill" in item_type.lower():
-            continue
-
         if item_type == "message":
             tid = row_turn_id(payload)
             if not tid or tid not in open_turns:
@@ -903,11 +930,17 @@ def build_turns(rows: List[Tuple[Dict[str, Any], int]]) -> List[Turn]:
             role = payload.get("role")
             text = extract_text(payload.get("content"))
             ts = parse_timestamp(row.get("timestamp"))
-            # Codex injects resolved Skill content as an additional user-role
-            # message. Do not classify the real prompt or assistant examples.
-            skill = _skill_name_from_payload(payload) if role == "user" and text != turn.user_text else None
-            if skill and skill not in turn.skills:
-                turn.skills.append(skill)
+            # Both the real prompt echo and a Skill injection are user-role
+            # messages, and either may arrive before event_msg/user_message.
+            # Defer candidates until that authoritative prompt is known so a
+            # prompt beginning with the Skill markup is not misclassified.
+            skill = _skill_name_from_payload(payload) if role == "user" else None
+            if skill:
+                if turn.user_text_authoritative:
+                    if text != turn.user_text:
+                        _record_skill(turn, skill)
+                else:
+                    turn.pending_skills.append((text, skill))
             if role == "user" and not turn.user_text_authoritative:
                 # Fallback only: response_item/message role=user rows can
                 # be injected context (e.g. <recommended_plugins>) rather
