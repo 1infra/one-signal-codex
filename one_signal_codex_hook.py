@@ -14,9 +14,9 @@ How Codex invokes this
 Two transports feed this same hook; it auto-detects which one fired.
 
 (A) Plugin `Stop` hook -- the PRIMARY, marketplace path (see
-../one-signal-codex/README.md and .codex-plugin/plugin.json +
+README.md and .codex-plugin/plugin.json +
 hooks/hooks.json). When the plugin is installed via `codex plugin
-marketplace add 1infra/1Infra` + `codex plugin add one-signal-codex@one-infra`,
+marketplace add 1infra/one-signal-codex` + `codex plugin add one-signal-codex@one-infra`,
 Codex runs the plugin's declared Stop `command` after every turn and pipes a
 JSON object to STDIN (verified against codex-cli 0.144.1):
 

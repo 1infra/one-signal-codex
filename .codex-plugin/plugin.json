@@ -6,8 +6,8 @@
     "name": "One Infra",
     "url": "https://1infra.io"
   },
-  "homepage": "https://github.com/1infra/1Infra/tree/main/plugins/one-signal-codex#readme",
-  "repository": "https://github.com/1infra/1Infra",
+  "homepage": "https://github.com/1infra/one-signal-codex#readme",
+  "repository": "https://github.com/1infra/one-signal-codex",
   "keywords": ["codex", "hooks", "observability", "tracing", "one-signal", "langfuse"],
   "hooks": "./hooks/hooks.json",
   "interface": {

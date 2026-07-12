@@ -3,7 +3,8 @@
 Trace every Codex CLI turn — model generations, tool calls, and token
 usage/cost — to your **One Infra** organization, with zero Langfuse
 credentials on your machine. This is the Codex CLI counterpart of
-[`plugins/one-signal`](../one-signal) (the Claude Code plugin): same
+[`one-signal-claude-code`](https://github.com/1infra/one-signal-claude-code)
+(the Claude Code plugin): same
 destination, same wire format, same One Connector access-token transport —
 different source, because Codex's session data model is unrelated to
 Claude Code's transcript format.
@@ -25,7 +26,7 @@ summary). Traces from Codex CLI and Claude Code render in the same **Console
 ## Install
 
 ```bash
-codex plugin marketplace add 1infra/1Infra
+codex plugin marketplace add 1infra/one-signal-codex
 codex plugin add one-signal-codex@one-infra
 mkdir -p ~/.codex && printf '{"ONE_SIGNAL_API_TOKEN":"oc_xxx"}' > ~/.codex/one-signal.json && chmod 600 ~/.codex/one-signal.json
 ```
@@ -35,8 +36,7 @@ new `codex` session (or run `codex exec "..."`) and your turns show up in
 **Console → Observe**.
 
 - **Line 1** registers this repo as a Codex plugin marketplace (Codex reads
-  `.agents/plugins/marketplace.json` at the repo root; this coexists with the
-  Claude Code marketplace at `.claude-plugin/marketplace.json`).
+  `.agents/plugins/marketplace.json` at the repo root).
 - **Line 2** installs and enables the plugin. It writes
   `[plugins."one-signal-codex@one-infra"] enabled = true` to
   `~/.codex/config.toml` for you. The plugin's Stop hook runs under Codex's
@@ -109,7 +109,7 @@ If you have this repo checked out and would rather use the legacy `notify`
 wiring instead of the plugin marketplace:
 
 ```bash
-python3 plugins/one-signal-codex/install.py --token oc_xxx
+python3 install.py --token oc_xxx
 ```
 
 This writes `~/.codex/one-signal.json` (chmod 600) and adds a `notify`
@@ -210,9 +210,9 @@ via `ONE_SIGNAL_CODEX_MAX_CHARS`.
 ## Self-test
 
 ```bash
-uv run python plugins/one-signal-codex/test_hook.py -v
+uv run python test_hook.py -v
 # or
-uv run python plugins/one-signal-codex/one_signal_codex_hook.py --self-test
+uv run python one_signal_codex_hook.py --self-test
 ```
 
 Runs the parser/assembly pipeline against a bundled fixture rollout
