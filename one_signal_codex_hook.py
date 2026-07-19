@@ -1237,6 +1237,15 @@ def usage_details_from_token_count(info_blob: Optional[Dict[str, Any]]) -> Optio
         v = usage.get(src)
         if isinstance(v, int) and v > 0:
             details[dst] = v
+    # Codex's input_tokens INCLUDES cached_input_tokens. Report `input` as the
+    # uncached remainder so Langfuse can price cache reads separately instead
+    # of billing them at the full input rate (1infra/1Infra#130).
+    if "input" in details and "cache_read_input_tokens" in details:
+        uncached = details["input"] - details["cache_read_input_tokens"]
+        if uncached > 0:
+            details["input"] = uncached
+        else:
+            del details["input"]
     return details or None
 
 def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: Path,

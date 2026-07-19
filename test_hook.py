@@ -321,7 +321,9 @@ class TestEventAssembly(unittest.TestCase):
         self.assertEqual(gen["body"]["model"], "gpt-test-model")
         usage = gen["body"]["usageDetails"]
         self.assertIsNotNone(usage)
-        self.assertEqual(usage.get("input"), 100)
+        # input_tokens=100 includes cached_input_tokens=10; reported input is
+        # the uncached remainder (see usage_details_from_token_count, #130).
+        self.assertEqual(usage.get("input"), 90)
         self.assertEqual(usage.get("output"), 20)
         self.assertEqual(usage.get("cache_read_input_tokens"), 10)
         self.assertEqual(usage.get("reasoning_output_tokens"), 5)
