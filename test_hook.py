@@ -1025,5 +1025,277 @@ class TestPluginHookConfiguration(unittest.TestCase):
         self.assertNotIn("plugins/cache", command)
 
 
+# Real 2026-07-20 e2e rollout: one aggregated custom_tool_call/exec that embeds
+# four shell steps (apply_patch + cat + failing ls + echo). Exit 1 for
+# `ls /nonexistent-directory-e2e-test` lives nested inside the JSON body of the
+# custom_tool_call_output list, not at a top-level exit_code field.
+FAILED_EXEC_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "rollout-failed-exec-e2e.jsonl"
+)
+FAILED_EXEC_THREAD = "019f7e1f-2aab-7801-906f-28bbca2a214f"
+
+
+class TestRealFailedExecRollout(unittest.TestCase):
+    def test_real_fixture_failing_exec_span_emits_level_error(self):
+        self.assertTrue(FAILED_EXEC_FIXTURE.is_file(), f"missing fixture {FAILED_EXEC_FIXTURE}")
+        rows = hook.read_new_lines(FAILED_EXEC_FIXTURE, 0)
+        turns = hook.build_turns(rows)
+        self.assertEqual(len(turns), 1)
+        self.assertTrue(turns[0].complete)
+
+        events = hook.build_turn_events(
+            FAILED_EXEC_THREAD, 1, turns[0], FAILED_EXEC_FIXTURE
+        )
+        tool_spans = [
+            event["body"]
+            for event in events
+            if event.get("type") == "observation-create"
+            and event["body"].get("type") == "SPAN"
+            and str(event["body"].get("name") or "").startswith("Tool:")
+        ]
+
+        # Bug 1b check: rollout records ONE aggregated exec custom_tool_call
+        # (four cmds inside the JS script), not four separate tool calls — so
+        # exactly one Tool span is correct, not a span-extraction miss.
+        self.assertEqual(len(tool_spans), 1, [b.get("name") for b in tool_spans])
+        body = tool_spans[0]
+        self.assertEqual(body["name"], "Tool: exec")
+        self.assertEqual(body["metadata"].get("exit_code"), 1)
+        self.assertEqual(body["metadata"].get("result_status"), "error")
+        self.assertEqual(body["level"], "ERROR")
+
+        # Any non-failing tool SPANs (none in this fixture beyond the single
+        # aggregated exec) must omit level entirely — assert the invariant on
+        # all successful tool spans derived from the same turn assembly path.
+        for span in tool_spans:
+            if span is body:
+                continue
+            self.assertNotIn("level", span)
+
+    def test_tool_call_exit_code_reads_nested_exec_mode_output(self):
+        # Exact shape from rollout line 17: custom_tool_call_output list with a
+        # preamble block + a JSON block whose nested expected_failure.exit_code=1.
+        payload = {
+            "type": "custom_tool_call_output",
+            "call_id": "call_UtFQuUbAUqqIFsRHrX5iTI1v",
+            "output": [
+                {
+                    "type": "input_text",
+                    "text": "Script completed\nWall time 0.8 seconds\nOutput:\n",
+                },
+                {
+                    "type": "input_text",
+                    "text": (
+                        '{"write":{},"cat":{"chunk_id":"dc33a5","exit_code":0,'
+                        '"output":"ok"},"expected_failure":{"chunk_id":"5c63d0",'
+                        '"exit_code":1,"output":"ls: No such file or directory\\n"},'
+                        '"echo":{"chunk_id":"90ccd6","exit_code":0,"output":"done\\n"}}'
+                    ),
+                },
+            ],
+        }
+        self.assertEqual(hook.tool_call_exit_code(payload), 1)
+
+
+class TestCommitOnSuccessful207(unittest.TestCase):
+    def test_successful_207_commits_completed_turn(self):
+        # Fully-successful multi-status ingest (failed=0) must advance the
+        # transcript checkpoint for a complete turn. Regression: prod logged
+        # "ingest ok: status=207 ... failed=0" then "only 0/1 completed turn(s)
+        # committed" when Stop raced task_complete / bookkeeping skipped accept.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            turn_id = "turn-commit-207"
+            rows = [
+                {
+                    "timestamp": "2026-07-12T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn_id},
+                },
+                {
+                    "timestamp": "2026-07-12T00:00:01Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "hello"},
+                },
+                {
+                    "timestamp": "2026-07-12T00:00:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": turn_id,
+                        "last_agent_message": "done",
+                    },
+                },
+            ]
+            rollout = root / f"rollout-{THREAD_ID}.jsonl"
+            rollout.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+
+            class Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    return False
+
+                def getcode(self):
+                    return 207
+
+                def read(self):
+                    return b'{"errors":[]}'
+
+            with (
+                mock.patch.object(hook, "STATE_DIR", state_dir),
+                mock.patch.object(hook, "STATE_FILE", state_dir / "state.json"),
+                mock.patch.object(hook, "LOCK_FILE", state_dir / "state.lock"),
+                mock.patch.object(
+                    hook,
+                    "resolve_config",
+                    return_value=("https://example.test", "oc_test", None),
+                ),
+                mock.patch.object(
+                    hook.urllib.request, "urlopen", return_value=Response()
+                ),
+                mock.patch.object(
+                    sys,
+                    "stdin",
+                    io.StringIO(
+                        json.dumps(
+                            {
+                                "session_id": THREAD_ID,
+                                "transcript_path": str(rollout),
+                            }
+                        )
+                    ),
+                ),
+            ):
+                result = hook.main(["one_signal_codex_hook.py"])
+
+            self.assertEqual(result, 0)
+            state_entries = [
+                value
+                for key, value in json.loads(
+                    (state_dir / "state.json").read_text(encoding="utf-8")
+                ).items()
+                if key != "_thread_paths"
+            ]
+            self.assertEqual(len(state_entries), 1)
+            self.assertGreater(state_entries[0]["offset"], 0)
+            self.assertEqual(state_entries[0]["turn_count"], 1)
+            self.assertEqual(state_entries[0]["partial_turn_ids"], [])
+
+    def test_stop_flush_wait_commits_when_task_complete_arrives_late(self):
+        # Codex Stop can fire a few hundred ms before task_complete is flushed
+        # to the rollout. Without a bounded re-read, the turn uploads as
+        # partial (207 ok) and never commits if no later Stop fires.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            turn_id = "turn-late-complete"
+            rollout = root / f"rollout-{THREAD_ID}.jsonl"
+            prefix = [
+                {
+                    "timestamp": "2026-07-12T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn_id},
+                },
+                {
+                    "timestamp": "2026-07-12T00:00:01Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "hello"},
+                },
+                {
+                    "timestamp": "2026-07-12T00:00:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "working"}],
+                        "internal_chat_message_metadata_passthrough": {
+                            "turn_id": turn_id
+                        },
+                    },
+                },
+            ]
+            complete = {
+                "timestamp": "2026-07-12T00:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": turn_id,
+                    "last_agent_message": "done",
+                },
+            }
+            rollout.write_text(
+                "".join(json.dumps(row) + "\n" for row in prefix), encoding="utf-8"
+            )
+
+            class Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    return False
+
+                def getcode(self):
+                    return 207
+
+                def read(self):
+                    return b'{"errors":[]}'
+
+            appended = {"done": False}
+
+            def sleepy_append(delay):
+                # First flush sleep: append task_complete so the re-read sees it.
+                if not appended["done"]:
+                    with rollout.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(complete) + "\n")
+                    appended["done"] = True
+
+            with (
+                mock.patch.object(hook, "STATE_DIR", state_dir),
+                mock.patch.object(hook, "STATE_FILE", state_dir / "state.json"),
+                mock.patch.object(hook, "LOCK_FILE", state_dir / "state.lock"),
+                mock.patch.object(
+                    hook,
+                    "resolve_config",
+                    return_value=("https://example.test", "oc_test", None),
+                ),
+                mock.patch.object(
+                    hook.urllib.request, "urlopen", return_value=Response()
+                ),
+                mock.patch.object(hook.time, "sleep", side_effect=sleepy_append),
+                mock.patch.object(
+                    sys,
+                    "stdin",
+                    io.StringIO(
+                        json.dumps(
+                            {
+                                "session_id": THREAD_ID,
+                                "transcript_path": str(rollout),
+                                "hook_event_name": "Stop",
+                            }
+                        )
+                    ),
+                ),
+            ):
+                result = hook.main(["one_signal_codex_hook.py"])
+
+            self.assertEqual(result, 0)
+            self.assertTrue(appended["done"])
+            state_entries = [
+                value
+                for key, value in json.loads(
+                    (state_dir / "state.json").read_text(encoding="utf-8")
+                ).items()
+                if key != "_thread_paths"
+            ]
+            self.assertEqual(state_entries[0]["turn_count"], 1)
+            self.assertGreater(state_entries[0]["offset"], 0)
+            self.assertEqual(state_entries[0]["partial_turn_ids"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

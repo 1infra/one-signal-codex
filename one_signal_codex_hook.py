@@ -188,7 +188,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-PLUGIN_VERSION = "0.1.8"
+PLUGIN_VERSION = "0.1.13"
 
 # --- Paths ---
 def _codex_home() -> Path:
@@ -222,6 +222,11 @@ MAX_BYTES_PER_BATCH = 3_500_000
 MAX_INSTRUCTION_DOCUMENTS = 20
 MAX_INSTRUCTION_DOCUMENT_CHARS = 64_000
 MAX_INSTRUCTION_DOCUMENTS_CHARS = 256_000
+# Codex can invoke Stop a few hundred ms before it appends task_complete to
+# the rollout. Bounded re-read delays (sum ≈ 1.55s) so a session's final turn
+# can still commit on that Stop instead of waiting for another turn that may
+# never happen.
+ROLLOUT_FLUSH_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
 
 # ----------------- Logging -----------------
 _logger: Optional[logging.Logger] = None
@@ -741,25 +746,85 @@ def tool_call_output_text(payload: Dict[str, Any]) -> str:
 
 COMMAND_TOOL_NAMES = frozenset({"exec", "exec_command", "shell", "shell_command", "write_stdin"})
 
-def tool_call_exit_code(payload: Dict[str, Any]) -> Optional[int]:
-    """Return an exit code only from the tool wrapper's structured output."""
-    out = payload.get("output")
-    structured = out if isinstance(out, dict) else None
-    if structured is None:
-        try:
-            parsed = json.loads(tool_call_output_text(payload))
-            structured = parsed if isinstance(parsed, dict) else None
-        except (json.JSONDecodeError, TypeError):
-            structured = None
-    if structured is not None:
-        code = structured.get("exit_code")
-        if (
-            isinstance(code, int)
-            and not isinstance(code, bool)
-            and abs(code) <= 9_007_199_254_740_991
-        ):
-            return code
+def _coerce_exit_code(value: Any) -> Optional[int]:
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and abs(value) <= 9_007_199_254_740_991
+    ):
+        return value
     return None
+
+
+def _collect_exit_codes(value: Any, out: List[int]) -> None:
+    """Walk structured tool output for process exit codes (top-level or nested)."""
+    if isinstance(value, dict):
+        code = _coerce_exit_code(value.get("exit_code"))
+        if code is not None:
+            out.append(code)
+        for child in value.values():
+            _collect_exit_codes(child, out)
+    elif isinstance(value, list):
+        for child in value:
+            _collect_exit_codes(child, out)
+
+
+def _parse_structured_tool_output(payload: Dict[str, Any]) -> Any:
+    """Best-effort structured parse of tool output.
+
+    Shapes observed in real rollouts:
+      - plain dict / JSON string with top-level exit_code (function_call_output)
+      - custom_tool_call_output list of {type:input_text,text} blocks whose
+        concatenated text is a preamble plus a JSON object (exec-mode); the
+        JSON may nest per-command results with their own exit_code fields
+        rather than a single top-level exit_code.
+    """
+    out = payload.get("output")
+    if isinstance(out, dict):
+        return out
+    text = tool_call_output_text(payload)
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Exec-mode wraps JSON after a human-readable preamble ("Script completed
+    # ... Output:\\n"). Scan for the first JSON value start and parse from there.
+    for i, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        try:
+            return json.loads(text[i:])
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return None
+
+
+def tool_call_exit_code(payload: Dict[str, Any]) -> Optional[int]:
+    """Return an exit code only from the tool wrapper's structured output.
+
+    Prefer a top-level exit_code when present. For aggregated exec-mode
+    results (multiple tools.exec_command outcomes nested under caller-chosen
+    keys), any nonzero nested exit_code wins so the Tool SPAN surfaces as
+    level=ERROR; if every nested code is 0, return 0; if none are found,
+    return None (do not invent an exit status from free text).
+    """
+    structured = _parse_structured_tool_output(payload)
+    if structured is None:
+        return None
+    if isinstance(structured, dict):
+        top = _coerce_exit_code(structured.get("exit_code"))
+        if top is not None:
+            return top
+    codes: List[int] = []
+    _collect_exit_codes(structured, codes)
+    if not codes:
+        return None
+    for code in codes:
+        if code != 0:
+            return code
+    return 0
 
 # ----------------- Incremental reader (byte-safe, mirrors the Claude
 # hook's read_new_jsonl -- see that file's FIX C comment for why splitting
@@ -802,6 +867,38 @@ def read_new_lines(rollout_path: Path, start_offset: int) -> List[Tuple[Dict[str
         rows.append((row, pos))
 
     return rows
+
+
+def read_completed_turns_after_flush(
+    rollout_path: Path, start_offset: int
+) -> Tuple[List[Tuple[Dict[str, Any], int]], List["Turn"]]:
+    rows = read_new_lines(rollout_path, start_offset)
+    if not rows:
+        return rows, []
+
+    # Codex can invoke Stop just before it appends task_complete. Re-read for
+    # a short bounded window so a session's final turn uploads on this Stop
+    # instead of waiting for another turn that may never happen.
+    for delay in ROLLOUT_FLUSH_DELAYS:
+        latest_started: Optional[str] = None
+        completed: set[str] = set()
+        for row, _ in rows:
+            payload = row.get("payload")
+            if row.get("type") != "event_msg" or not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "task_started" and isinstance(payload.get("turn_id"), str):
+                latest_started = payload["turn_id"]
+            elif (
+                payload.get("type") in ("task_complete", "turn_aborted")
+                and isinstance(payload.get("turn_id"), str)
+            ):
+                completed.add(payload["turn_id"])
+        if latest_started is None or latest_started in completed:
+            break
+        time.sleep(delay)
+        rows = read_new_lines(rollout_path, start_offset) or rows
+
+    return rows, build_turns(rows)
 
 
 # ----------------- Turn assembly -----------------
@@ -1810,12 +1907,11 @@ def main(argv: List[str]) -> int:
             }
             known_instruction_documents = set(persisted_instruction_documents)
 
-            rows = read_new_lines(rollout_path, offset)
+            rows, turns = read_completed_turns_after_flush(rollout_path, offset)
             if not rows:
                 save_state(state)
                 return 0
 
-            turns = build_turns(rows)
             if not turns:
                 save_state(state)
                 return 0
