@@ -191,3 +191,24 @@ Runs the parser/assembly pipeline against a bundled fixture rollout
 (`fixtures/sample_rollout.jsonl`) with no network calls, asserting the built
 batch's event types, tool-span metadata, usage details, and that no
 encrypted reasoning content ever leaks into an event.
+
+## Release checklist
+
+**Every version bump must run the release smoke before announcing.**
+
+Unit tests alone are not enough: run a live `codex exec` path that hits a
+failing tool call and fake secrets, then verify the uploaded trace on the
+Console API (observation tree, `TOOL` + `level=ERROR`, no secret leak,
+nonzero cost).
+
+```bash
+./scripts/release-smoke.sh
+# optional:
+CONNECTOR_URL=https://connector.1infra.io ./scripts/release-smoke.sh
+```
+
+The script runs the Codex session automatically and prints a verification
+checklist + `curl`/`jq` template. Console Observe reads are
+browser-session authenticated (not the plugin `oc_` token) — see
+[scripts/release-smoke.md](scripts/release-smoke.md) for the full
+procedure and gates.
