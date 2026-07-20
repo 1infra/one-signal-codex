@@ -384,11 +384,17 @@ class TestEventAssembly(unittest.TestCase):
         spans = [e for e in self._observations_by_body_type("SPAN") if e["body"]["name"] == "Turn 1"]
         self.assertEqual(len(spans), 1)
         self.assertIsNone(spans[0]["body"].get("parentObservationId"))
+        # Root SPAN stays on observation-create (only GENERATION uses generation-create).
+        self.assertEqual(spans[0]["type"], "observation-create")
 
     def test_generation_present_with_model_and_usage(self):
-        generations = self._observations_by_body_type("GENERATION")
+        # generation-create is required so Langfuse populates providedModelName;
+        # observation-create stores body.model but leaves that metrics dim null.
+        generations = self._by_type("generation-create")
         self.assertGreaterEqual(len(generations), 1)
         gen = generations[0]
+        self.assertEqual(gen["type"], "generation-create")
+        self.assertNotIn("type", gen["body"])
         self.assertEqual(gen["body"]["model"], "gpt-test-model")
         usage = gen["body"]["usageDetails"]
         self.assertIsNotNone(usage)
@@ -610,12 +616,24 @@ class TestStopHookEntrypoint(unittest.TestCase):
                 event for event in delivered
                 if event["body"].get("id") == f"{THREAD_ID}-t1-root"
             )
-            partial_observations = [event for event in delivered if event["type"].startswith("observation-")]
+            # Creates: SPAN/EVENT → observation-create; GENERATION → generation-create.
+            partial_observations = [
+                event for event in delivered
+                if event["type"] in ("observation-create", "generation-create")
+            ]
             state_entries = [value for key, value in json.loads((state_dir / "state.json").read_text()).items() if key != "_thread_paths"]
             self.assertEqual(result, 0)
             self.assertEqual(trace["body"]["id"], f"{THREAD_ID}-t1")
             self.assertEqual(trace["body"]["metadata"]["completed"], False)
-            self.assertTrue(all(event["type"] == "observation-create" for event in partial_observations))
+            self.assertTrue(
+                any(event["type"] == "generation-create" for event in partial_observations)
+            )
+            self.assertTrue(
+                any(
+                    event["type"] == "observation-create" and event["body"].get("type") == "SPAN"
+                    for event in partial_observations
+                )
+            )
             self.assertEqual(state_entries[0]["offset"], 0)
             self.assertEqual(state_entries[0]["turn_count"], 0)
             self.assertEqual(state_entries[0]["partial_turn_ids"], [turn_id])
@@ -643,7 +661,10 @@ class TestStopHookEntrypoint(unittest.TestCase):
                 event for event in finalized
                 if event["body"].get("id") == root_span["body"]["id"]
             )
-            final_observations = [event for event in finalized if event["type"].startswith("observation-")]
+            # Updates reuse observation-update for all observation kinds (same ids).
+            final_observations = [
+                event for event in finalized if event["type"] == "observation-update"
+            ]
             final_entries = [value for key, value in json.loads((state_dir / "state.json").read_text()).items() if key != "_thread_paths"]
             self.assertEqual(final_trace["body"]["id"], trace["body"]["id"])
             self.assertEqual(final_trace["body"]["metadata"]["completed"], True)
