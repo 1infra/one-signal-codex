@@ -573,17 +573,82 @@ _REDACT_PEM_RE = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
     re.DOTALL,
 )
+# Provider-token shapes harvested from betterleaks v1.5.0 rule sources
+# (cmd/generate/config/rules/*.go + config/betterleaks.toml) and, where
+# missing there, gitleaks master config/gitleaks.toml. Only anchored
+# prefix + bounded-charset rules; bare hex/base64 entropy rules stay out.
+# More-specific sk-* prefixes MUST stay above the generic openai sk- rule.
 _REDACT_TOKEN_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<REDACTED:aws>"),
     (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}\b"), "<REDACTED:github>"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,255}\b"), "<REDACTED:github>"),
     # Stripe before generic sk- so sk_live_/sk_test_ never fall into openai.
     (re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"), "<REDACTED:stripe>"),
+    # sk-ant- (anthropic-api-key / anthropic-admin-api-key) before generic sk-.
+    (re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"), "<REDACTED:anthropic>"),
+    # sk-or-v1- (openrouter-api-key) before generic sk-.
+    (re.compile(r"\bsk-or-v1-[0-9a-fA-F]{64}\b"), "<REDACTED:openrouter>"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), "<REDACTED:openai>"),
     (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "<REDACTED:slack>"),
     (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "<REDACTED:google>"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b"),
      "<REDACTED:jwt>"),
+    # --- expanded SaaS tokens (betterleaks / gitleaks) ---
+    # figma-personal-access-token
+    (re.compile(r"\bfigd_[A-Za-z0-9_-]{38,42}\b"), "<REDACTED:figma>"),
+    # npm-access-token
+    (re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"), "<REDACTED:npm>"),
+    # gitlab-pat (+ routable variants share glpat- prefix; {20,} covers both)
+    (re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"), "<REDACTED:gitlab>"),
+    # huggingface-access-token
+    (re.compile(r"\bhf_[A-Za-z]{34}\b"), "<REDACTED:huggingface>"),
+    # supabase-management-token / supabase-project-api-key
+    (re.compile(r"\bsbp_[a-z0-9_-]{40}\b"), "<REDACTED:supabase>"),
+    (re.compile(r"\bsb_secret_[A-Za-z0-9_-]{31}\b"), "<REDACTED:supabase>"),
+    # shopify-access-token / custom / private-app / shared-secret
+    (re.compile(r"\b(?:shpat|shpca|shppa|shpss)_[a-fA-F0-9]{32}\b"),
+     "<REDACTED:shopify>"),
+    # digitalocean-pat / access-token / refresh-token
+    (re.compile(r"\b(?:dop|doo|dor)_v1_[a-f0-9]{64}\b"),
+     "<REDACTED:digitalocean>"),
+    # databricks-api-token
+    (re.compile(r"\bdapi[a-f0-9]{32}(?:-\d)?\b"), "<REDACTED:databricks>"),
+    # sendgrid-api-token
+    (re.compile(r"\bSG\.[A-Za-z0-9=_\-.]{66}\b"), "<REDACTED:sendgrid>"),
+    # telegram-bot-api-token body (source semi-generic; token shape is unique)
+    (re.compile(r"\b[0-9]{8,10}:A[A-Za-z0-9_-]{34}\b"), "<REDACTED:telegram>"),
+    # airtable-personnal-access-token
+    (re.compile(r"\bpat[A-Za-z0-9]{14}\.[a-f0-9]{64}\b"), "<REDACTED:airtable>"),
+    # grafana-cloud-api-token / grafana-service-account-token
+    (re.compile(r"\bglc_[A-Za-z0-9+/]{32,400}={0,3}\b"), "<REDACTED:grafana>"),
+    (re.compile(r"\bglsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}\b"), "<REDACTED:grafana>"),
+    # sentry-org-token (prefix + bounded base64 body; full JSON fragment check dropped)
+    (re.compile(r"\bsntrys_[A-Za-z0-9+/=_]{40,}\b"), "<REDACTED:sentry>"),
+    # flyio-access-token (fo1_ shape from gitleaks.toml; betterleaks uses FlyV1)
+    (re.compile(r"\bfo1_[\w-]{43}\b"), "<REDACTED:fly>"),
+    # groq-api-key
+    (re.compile(r"\bgsk_[A-Za-z0-9]{52}\b"), "<REDACTED:groq>"),
+    # xai-api-key
+    (re.compile(r"\bxai-[A-Za-z0-9_-]{70,120}\b"), "<REDACTED:xai>"),
+    # perplexity-api-key
+    (re.compile(r"\bpplx-[A-Za-z0-9]{48}\b"), "<REDACTED:perplexity>"),
+    # replicate-api-token
+    (re.compile(r"\br8_[A-Za-z0-9]{37}\b"), "<REDACTED:replicate>"),
+    # doppler-api-token
+    (re.compile(r"\bdp\.pt\.[A-Za-z0-9]{43}\b"), "<REDACTED:doppler>"),
+    # linear-api-key
+    (re.compile(r"\blin_api_[A-Za-z0-9]{40}\b"), "<REDACTED:linear>"),
+    # notion-api-token
+    (re.compile(r"\bntn_[0-9]{11}[A-Za-z0-9]{35}\b"), "<REDACTED:notion>"),
+    # postman-api-token
+    (re.compile(r"\bPMAK-[a-fA-F0-9]{24}-[a-fA-F0-9]{34}\b"),
+     "<REDACTED:postman>"),
+    # 1password-service-account-token
+    (re.compile(r"\bops_eyJ[A-Za-z0-9+/]{250,}={0,3}\b"),
+     "<REDACTED:1password>"),
+    # vercel-personal-access-token / integration / app / refresh / ai-gateway
+    (re.compile(r"\bv(?:cp|ci|ca|cr|ck)_[A-Za-z0-9_-]{56}\b"),
+     "<REDACTED:vercel>"),
 )
 # Mask only the password segment; keep scheme/user/host for debugging.
 _REDACT_DB_URI_RE = re.compile(

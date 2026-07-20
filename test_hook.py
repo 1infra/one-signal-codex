@@ -706,6 +706,154 @@ class TestRedactText(unittest.TestCase):
         self.assertNotIn(live, out)
         self.assertNotIn(test, out)
 
+    # --- Expanded SaaS tokens (betterleaks / gitleaks shapes; FAKE only) ---
+
+    def test_anthropic_sk_ant_before_generic_sk(self):
+        tok = "sk-ant-api03-" + ("A" * 20)
+        out = hook.redact_text(f"key={tok}")
+        self.assertIn("<REDACTED:anthropic>", out)
+        self.assertNotIn(tok, out)
+        self.assertNotIn("<REDACTED:openai>", out)
+
+    def test_openrouter_sk_or_before_generic_sk(self):
+        tok = "sk-or-v1-" + ("a" * 64)
+        out = hook.redact_text(f"key={tok}")
+        self.assertIn("<REDACTED:openrouter>", out)
+        self.assertNotIn(tok, out)
+        self.assertNotIn("<REDACTED:openai>", out)
+
+    def test_figma_token(self):
+        tok = "figd_" + ("A" * 40)
+        out = hook.redact_text(f"token {tok}")
+        self.assertIn("<REDACTED:figma>", out)
+        self.assertNotIn(tok, out)
+
+    def test_npm_token(self):
+        tok = "npm_" + ("a" * 36)
+        out = hook.redact_text(f"auth {tok}")
+        self.assertIn("<REDACTED:npm>", out)
+        self.assertNotIn(tok, out)
+
+    def test_gitlab_pat(self):
+        tok = "glpat-" + ("x" * 20)
+        out = hook.redact_text(f"GITLAB={tok}")
+        self.assertIn("<REDACTED:gitlab>", out)
+        self.assertNotIn(tok, out)
+
+    def test_huggingface_token(self):
+        tok = "hf_" + ("a" * 34)
+        out = hook.redact_text(f"Bearer {tok}")
+        self.assertIn("<REDACTED:huggingface>", out)
+        self.assertNotIn(tok, out)
+
+    def test_supabase_sbp_and_sb_secret(self):
+        sbp = "sbp_" + ("a" * 40)
+        secret = "sb_secret_" + ("b" * 31)
+        out = hook.redact_text(f"{sbp} {secret}")
+        self.assertEqual(out.count("<REDACTED:supabase>"), 2)
+        self.assertNotIn(sbp, out)
+        self.assertNotIn(secret, out)
+
+    def test_shopify_tokens(self):
+        tok = "shpat_" + ("a" * 32)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:shopify>")
+
+    def test_digitalocean_tokens(self):
+        tok = "dop_v1_" + ("a" * 64)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:digitalocean>")
+
+    def test_databricks_token(self):
+        tok = "dapi" + ("a" * 32)
+        out = hook.redact_text(f"token={tok}")
+        self.assertIn("<REDACTED:databricks>", out)
+        self.assertNotIn(tok, out)
+
+    def test_sendgrid_token(self):
+        tok = "SG." + ("A" * 66)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:sendgrid>")
+
+    def test_telegram_bot_token(self):
+        tok = "1234567890:A" + ("A" * 34)
+        out = hook.redact_text(f"bot {tok}")
+        self.assertIn("<REDACTED:telegram>", out)
+        self.assertNotIn(tok, out)
+
+    def test_airtable_pat(self):
+        tok = "pat" + ("A" * 14) + "." + ("a" * 64)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:airtable>")
+
+    def test_grafana_glc_and_glsa(self):
+        glc = "glc_" + ("A" * 40)
+        glsa = "glsa_" + ("A" * 32) + "_" + ("a" * 8)
+        out = hook.redact_text(f"{glc} {glsa}")
+        self.assertEqual(out.count("<REDACTED:grafana>"), 2)
+        self.assertNotIn(glc, out)
+        self.assertNotIn(glsa, out)
+
+    def test_sentry_org_token(self):
+        tok = "sntrys_" + ("A" * 50)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:sentry>")
+
+    def test_fly_fo1_token(self):
+        tok = "fo1_" + ("a" * 43)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:fly>")
+
+    def test_groq_token(self):
+        tok = "gsk_" + ("A" * 52)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:groq>")
+
+    def test_xai_token(self):
+        tok = "xai-" + ("A" * 80)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:xai>")
+
+    def test_perplexity_token(self):
+        tok = "pplx-" + ("A" * 48)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:perplexity>")
+
+    def test_replicate_token(self):
+        tok = "r8_" + ("A" * 37)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:replicate>")
+
+    def test_doppler_token(self):
+        tok = "dp.pt." + ("a" * 43)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:doppler>")
+
+    def test_linear_token(self):
+        tok = "lin_api_" + ("a" * 40)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:linear>")
+
+    def test_notion_token(self):
+        tok = "ntn_" + ("1" * 11) + ("A" * 35)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:notion>")
+
+    def test_postman_token(self):
+        tok = "PMAK-" + ("a" * 24) + "-" + ("b" * 34)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:postman>")
+
+    def test_onepassword_ops_token(self):
+        tok = "ops_eyJ" + ("A" * 250)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:1password>")
+
+    def test_vercel_token(self):
+        tok = "vcp_" + ("A" * 56)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:vercel>")
+
     def test_jwt(self):
         # Three base64url segments; header typically starts with eyJ
         jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturexx"
@@ -754,6 +902,30 @@ class TestRedactText(unittest.TestCase):
         # skill-style names that merely contain the "sk-" substring.
         prose = "skill-name-with-sk-prefix is fine; also mysk-not-a-token"
         self.assertEqual(hook.redact_text(prose), prose)
+
+    def test_sk_ant_lookalike_too_short_unchanged(self):
+        # sk-ant- body must be ≥20 chars after the prefix.
+        short = "sk-ant-tooshort"
+        self.assertEqual(hook.redact_text(short), short)
+
+    def test_sk_or_lookalike_wrong_shape_unchanged(self):
+        # openrouter requires sk-or-v1- + exactly 64 hex; short/non-hex fall through.
+        short = "sk-or-v1-nothex"
+        # Not enough hex digits → not openrouter; too short for generic sk- either
+        # if the total after "sk-" is < 20. Pad carefully so generic also misses.
+        self.assertEqual(hook.redact_text(short), short)
+
+    def test_figma_lookalike_too_short_unchanged(self):
+        short = "figd_tooshort"
+        self.assertEqual(hook.redact_text(short), short)
+
+    def test_npm_lookalike_too_short_unchanged(self):
+        short = "npm_short"
+        self.assertEqual(hook.redact_text(short), short)
+
+    def test_gitlab_lookalike_too_short_unchanged(self):
+        short = "glpat-short"
+        self.assertEqual(hook.redact_text(short), short)
 
     def test_plain_url_without_password_unchanged(self):
         url = "See https://example.com/path?q=1 and postgres://localhost/db"
