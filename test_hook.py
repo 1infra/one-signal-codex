@@ -369,11 +369,27 @@ class TestEventAssembly(unittest.TestCase):
     def _by_type(self, langfuse_type):
         return [e for e in self.events if e["type"] == langfuse_type]
 
-    def _observations_by_body_type(self, body_type):
-        return [e for e in self.events if e["body"].get("type") == body_type]
+    def _observations_by_kind(self, kind):
+        # Typed envelopes omit body.type; kind is implied by envelope type.
+        envelopes = {
+            "SPAN": ("span-create", "span-update"),
+            "EVENT": ("event-create",),
+            "GENERATION": ("generation-create", "generation-update"),
+        }
+        return [e for e in self.events if e["type"] in envelopes.get(kind, ())]
 
     def test_exactly_one_trace_create(self):
         self.assertEqual(len(self._by_type("trace-create")), 1)
+
+    def test_no_classic_observation_envelopes(self):
+        # Classic observation-create/update drop body.environment and body.model
+        # (verified 2026-07-20 production Langfuse 4-way matrix). Every obs in
+        # a built batch must use a typed envelope.
+        classic = [
+            e for e in self.events
+            if e["type"] in ("observation-create", "observation-update")
+        ]
+        self.assertEqual(classic, [], [e["type"] for e in classic])
 
     def test_trace_id_and_name_deterministic(self):
         trace = self._by_type("trace-create")[0]
@@ -381,15 +397,17 @@ class TestEventAssembly(unittest.TestCase):
         self.assertIn("Codex CLI - Turn 1", trace["body"]["name"])
 
     def test_root_span_present(self):
-        spans = [e for e in self._observations_by_body_type("SPAN") if e["body"]["name"] == "Turn 1"]
+        spans = [e for e in self._observations_by_kind("SPAN") if e["body"]["name"] == "Turn 1"]
         self.assertEqual(len(spans), 1)
         self.assertIsNone(spans[0]["body"].get("parentObservationId"))
-        # Root SPAN stays on observation-create (only GENERATION uses generation-create).
-        self.assertEqual(spans[0]["type"], "observation-create")
+        # Root SPAN uses span-create (typed); body.type is implied by envelope.
+        self.assertEqual(spans[0]["type"], "span-create")
+        self.assertNotIn("type", spans[0]["body"])
 
     def test_generation_present_with_model_and_usage(self):
         # generation-create is required so Langfuse populates providedModelName;
-        # observation-create stores body.model but leaves that metrics dim null.
+        # classic observation-create stores body.model but leaves that metrics
+        # dim null (and also drops environment).
         generations = self._by_type("generation-create")
         self.assertGreaterEqual(len(generations), 1)
         gen = generations[0]
@@ -407,7 +425,7 @@ class TestEventAssembly(unittest.TestCase):
 
     def test_tool_span_carries_metadata_tool_name(self):
         tool_spans = [
-            e for e in self._observations_by_body_type("SPAN")
+            e for e in self._observations_by_kind("SPAN")
             if "tool_name" in (e["body"].get("metadata") or {})
         ]
         # The fixture yields exactly two tool spans: the shell call and the
@@ -416,10 +434,10 @@ class TestEventAssembly(unittest.TestCase):
         span = next(s for s in tool_spans if s["body"]["metadata"]["tool_name"] == "shell")
         self.assertEqual(span["body"]["metadata"]["tool_id"], "call_fixture_1")
         self.assertIn("hi", span["body"]["output"])
-        # Classic ingestion's observation-create only accepts
-        # GENERATION | SPAN | EVENT -- a literal "TOOL" type would be
-        # silently rejected by the real ingest endpoint.
-        self.assertIn(span["body"]["type"], ("GENERATION", "SPAN", "EVENT"))
+        # Tool calls emit as SPAN via span-create (there is no "TOOL" envelope);
+        # classic ingestion would also reject a literal "TOOL" body.type.
+        self.assertEqual(span["type"], "span-create")
+        self.assertNotIn("type", span["body"])
 
     def test_skill_injection_is_aggregated_on_trace(self):
         trace = self._by_type("trace-create")[0]
@@ -431,7 +449,7 @@ class TestEventAssembly(unittest.TestCase):
 
     def test_mcp_call_is_emitted_as_attributed_tool_span(self):
         spans = [
-            e for e in self._observations_by_body_type("SPAN")
+            e for e in self._observations_by_kind("SPAN")
             if (e["body"].get("metadata") or {}).get("mcp_server") == "github"
         ]
         self.assertEqual(len(spans), 1)
@@ -471,7 +489,8 @@ class TestEventAssembly(unittest.TestCase):
         events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
         spans = [
             e for e in events
-            if e["body"].get("type") == "SPAN" and (e["body"].get("metadata") or {}).get("mcp_server") == "exa"
+            if e["type"] in ("span-create", "span-update")
+            and (e["body"].get("metadata") or {}).get("mcp_server") == "exa"
         ]
         self.assertEqual(len(spans), 1)
         body = spans[0]["body"]
@@ -483,9 +502,11 @@ class TestEventAssembly(unittest.TestCase):
 
     def test_reasoning_event_present_without_leaking_ciphertext(self):
         reasoning_events = [
-            e for e in self._observations_by_body_type("EVENT") if e["body"]["name"] == "Reasoning"
+            e for e in self._observations_by_kind("EVENT") if e["body"]["name"] == "Reasoning"
         ]
         self.assertEqual(len(reasoning_events), 1)
+        self.assertEqual(reasoning_events[0]["type"], "event-create")
+        self.assertNotIn("type", reasoning_events[0]["body"])
         serialized = json.dumps(self.events)
         self.assertNotIn('"encrypted_content":', serialized)
         self.assertNotIn("ENCRYPTED_BLOB_DO_NOT_SEND", serialized)
@@ -579,7 +600,8 @@ class TestStopHookEntrypoint(unittest.TestCase):
                 if event["body"].get("id") == f"{THREAD_ID}-t1-root"
             )
             state_entries = [value for key, value in json.loads((state_dir / "state.json").read_text()).items() if key != "_thread_paths"]
-            self.assertEqual(root_span["type"], "observation-create")
+            self.assertEqual(root_span["type"], "span-create")
+            self.assertNotIn("type", root_span["body"])
             self.assertLess(root_span["body"]["startTime"], root_span["body"]["endTime"])
             self.assertEqual(state_entries[0]["partial_turn_ids"], [])
 
@@ -616,10 +638,11 @@ class TestStopHookEntrypoint(unittest.TestCase):
                 event for event in delivered
                 if event["body"].get("id") == f"{THREAD_ID}-t1-root"
             )
-            # Creates: SPAN/EVENT → observation-create; GENERATION → generation-create.
+            # Creates: SPAN → span-create; GENERATION → generation-create;
+            # EVENT → event-create. Classic observation-* must not appear.
+            typed_create = ("span-create", "generation-create", "event-create")
             partial_observations = [
-                event for event in delivered
-                if event["type"] in ("observation-create", "generation-create")
+                event for event in delivered if event["type"] in typed_create
             ]
             state_entries = [value for key, value in json.loads((state_dir / "state.json").read_text()).items() if key != "_thread_paths"]
             self.assertEqual(result, 0)
@@ -629,9 +652,12 @@ class TestStopHookEntrypoint(unittest.TestCase):
                 any(event["type"] == "generation-create" for event in partial_observations)
             )
             self.assertTrue(
+                any(event["type"] == "span-create" for event in partial_observations)
+            )
+            self.assertFalse(
                 any(
-                    event["type"] == "observation-create" and event["body"].get("type") == "SPAN"
-                    for event in partial_observations
+                    event["type"] in ("observation-create", "observation-update")
+                    for event in delivered
                 )
             )
             self.assertEqual(state_entries[0]["offset"], 0)
@@ -661,9 +687,10 @@ class TestStopHookEntrypoint(unittest.TestCase):
                 event for event in finalized
                 if event["body"].get("id") == root_span["body"]["id"]
             )
-            # Updates reuse observation-update for all observation kinds (same ids).
+            # Updates use typed *-update envelopes (EVENT re-emits event-create).
+            typed_update = ("span-update", "generation-update", "event-create")
             final_observations = [
-                event for event in finalized if event["type"] == "observation-update"
+                event for event in finalized if event["type"] in typed_update
             ]
             final_entries = [value for key, value in json.loads((state_dir / "state.json").read_text()).items() if key != "_thread_paths"]
             self.assertEqual(final_trace["body"]["id"], trace["body"]["id"])
@@ -672,7 +699,16 @@ class TestStopHookEntrypoint(unittest.TestCase):
                 {event["body"]["id"] for event in final_observations},
                 {event["body"]["id"] for event in partial_observations},
             )
-            self.assertTrue(all(event["type"] == "observation-update" for event in final_observations))
+            self.assertTrue(
+                all(event["type"] in typed_update for event in final_observations)
+            )
+            self.assertFalse(
+                any(
+                    event["type"] in ("observation-create", "observation-update")
+                    for event in finalized
+                )
+            )
+            self.assertEqual(final_root_span["type"], "span-update")
             self.assertLess(final_root_span["body"]["startTime"], final_root_span["body"]["endTime"])
             self.assertGreater(final_entries[0]["offset"], 0)
             self.assertEqual(final_entries[0]["turn_count"], 1)
@@ -1070,10 +1106,21 @@ class TestRealFailedExecRollout(unittest.TestCase):
         tool_spans = [
             event["body"]
             for event in events
-            if event.get("type") == "observation-create"
-            and event["body"].get("type") == "SPAN"
+            if event.get("type") in ("span-create", "span-update")
             and str(event["body"].get("name") or "").startswith("Tool:")
         ]
+        # Real rollout ERROR tool span must use a typed envelope so level +
+        # environment reach org-scoped reads (classic observation-create drops both).
+        self.assertFalse(
+            any(e["type"] in ("observation-create", "observation-update") for e in events)
+        )
+        tool_events = [
+            event for event in events
+            if event.get("type") in ("span-create", "span-update")
+            and str(event["body"].get("name") or "").startswith("Tool:")
+        ]
+        self.assertTrue(all(e["type"] == "span-create" for e in tool_events))
+        self.assertTrue(all("type" not in e["body"] for e in tool_events))
 
         # Bug 1b check: rollout records ONE aggregated exec custom_tool_call
         # (four cmds inside the JS script), not four separate tool calls — so

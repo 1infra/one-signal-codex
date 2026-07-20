@@ -148,14 +148,19 @@ hook's "one trace per Stop-hook turn":
     "Tool: <name>", metadata.tool_name/tool_id set -- SAME encoding as the
     Claude hook (classic ingestion's observation-create only accepts
     GENERATION | SPAN | EVENT; there is no "TOOL" type).
-  - GENERATION rows use envelope type `generation-create` (not
-    observation-create): observation-create accepts body.model and stores
-    it on the observation read API, but does NOT populate Langfuse's
-    `provided_model_name` column, so the metrics API dimension
-    `providedModelName` stays null and Models analytics is empty.
-    generation-create with the same body.model does populate it; body.type
-    is omitted on that envelope (the event type implies GENERATION).
-    SPAN and EVENT stay on observation-create / observation-update.
+  - All observations use *typed* envelopes (not classic
+    observation-create / observation-update):
+      SPAN create → span-create; SPAN update → span-update
+      EVENT create → event-create (no event-update variant; on re-emit of a
+      partial turn we re-send event-create with the same id)
+      GENERATION create → generation-create; GENERATION update → generation-update
+    Typed envelopes omit body.type (implied by the event type). Classic
+    observation-create/update DROP body.environment (obs lands in env
+    "default", invisible to org-scoped reads) and body.model (so the metrics
+    dimension providedModelName stays null and Models analytics is empty) —
+    verified 2026-07-20 production Langfuse 4-way matrix. generation-create
+    with the same body.model does populate provided_model_name; span-create
+    with body.level=ERROR is what feeds errorRate for failed tool spans.
   - one EVENT per reasoning item, nested under its generation, carrying
     only `summary` (if non-empty) + a boolean flag -- never
     `encrypted_content`.
@@ -196,7 +201,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-PLUGIN_VERSION = "0.1.14"
+PLUGIN_VERSION = "0.1.15"
 
 # --- Paths ---
 def _codex_home() -> Path:
@@ -1312,7 +1317,7 @@ def _observation_event(*, obs_id: str, trace_id: str, parent_id: Optional[str], 
                          usage_details: Optional[Dict[str, int]] = None,
                          metadata: Optional[Dict[str, Any]] = None,
                          level: Optional[str] = None,
-                         event_type: str = "observation-create") -> Dict[str, Any]:
+                         update: bool = False) -> Dict[str, Any]:
     # Classic ingestion's legacy observation `type` only accepts
     # GENERATION | SPAN | EVENT -- callers below never pass anything
     # else (same constraint as ../one-signal; a "TOOL" type is
@@ -1322,10 +1327,27 @@ def _observation_event(*, obs_id: str, trace_id: str, parent_id: Optional[str], 
     # read API but does NOT populate provided_model_name, so the metrics
     # dimension providedModelName is null and Models analytics stays empty
     # (verified 2026-07-20 against production Langfuse: same batch with
-    # generation-create does populate it). For GENERATION creates, pass
-    # event_type="generation-create" and omit body.type (event type
-    # implies GENERATION). SPAN / EVENT stay on observation-create;
-    # observation-update keeps body.type for all observation kinds.
+    # generation-create does populate it).
+    #
+    # Additionally (same 2026-07-20 4-way matrix): classic observation-create
+    # / observation-update DROP body.environment (obs lands in env "default",
+    # invisible to org-scoped reads) and body.model. Typed envelopes
+    # (span-create / span-update / generation-create / generation-update /
+    # event-create) honor both environment and model. There is no
+    # event-update variant — if an EVENT is re-emitted on a partial-turn
+    # finalize, re-send event-create with the same id. All typed envelopes
+    # omit body.type (implied by the event type).
+    if obs_type == "GENERATION":
+        event_type = "generation-update" if update else "generation-create"
+    elif obs_type == "SPAN":
+        event_type = "span-update" if update else "span-create"
+    elif obs_type == "EVENT":
+        # No event-update in the typed API; re-emit event-create with same id.
+        event_type = "event-create"
+    else:
+        # Unreachable under current callers; keep a classic fallback only so a
+        # future obs_type does not silently lose the row.
+        event_type = "observation-update" if update else "observation-create"
     body: Dict[str, Any] = {
         "id": obs_id,
         "traceId": trace_id,
@@ -1339,7 +1361,9 @@ def _observation_event(*, obs_id: str, trace_id: str, parent_id: Optional[str], 
         "usageDetails": usage_details,
         "metadata": metadata,
     }
-    if event_type != "generation-create":
+    # Typed envelopes imply the observation kind; classic fallback still needs
+    # body.type so the ingest endpoint accepts the row.
+    if event_type in ("observation-create", "observation-update"):
         body["type"] = obs_type
     # Langfuse observation level drives errorRate (share of level==ERROR).
     # Only emit on real failures; omit entirely on success (do not send DEFAULT).
@@ -1558,7 +1582,6 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
 
     trace_id = f"{thread_id}-t{turn_num}"
     root_obs_id = f"{trace_id}-root"
-    observation_event_type = "observation-update" if update_observations else "observation-create"
 
     events.append(_trace_create(
         trace_id=trace_id,
@@ -1582,7 +1605,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
         input_={"role": "user", "content": user_text},
         output={"role": "assistant", "content": final_text},
         metadata=turn_metadata,
-        event_type=observation_event_type,
+        update=update_observations,
     ))
 
     prev_ts = turn.user_ts
@@ -1609,10 +1632,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
         gen_end_ts = max(end_candidates) if end_candidates else prev_ts
 
         # GENERATION create must use generation-create so providedModelName
-        # populates; updates keep observation-update (same observation ids).
-        gen_event_type = (
-            "observation-update" if update_observations else "generation-create"
-        )
+        # populates; updates use generation-update (same observation ids).
         events.append(_observation_event(
             obs_id=gen_id,
             trace_id=trace_id,
@@ -1631,7 +1651,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                 "tool_count": len(rnd.tool_calls),
                 "has_reasoning": rnd.reasoning is not None,
             },
-            event_type=gen_event_type,
+            update=update_observations,
         ))
 
         if rnd.reasoning is not None:
@@ -1657,7 +1677,8 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                     "has_encrypted_content": bool(rnd.reasoning.get("encrypted_content")),
                     "reasoning_id": rnd.reasoning.get("id"),
                 },
-                event_type=observation_event_type,
+                # No event-update; re-emit event-create with same id on updates.
+                update=update_observations,
             ))
 
         for t_idx, tc in enumerate(rnd.tool_calls):
@@ -1711,7 +1732,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                     "output_meta": toutput_meta,
                 },
                 level=tool_level,
-                event_type=observation_event_type,
+                update=update_observations,
             ))
 
         prev_ts = gen_end_ts or prev_ts
@@ -2052,10 +2073,18 @@ def run_self_test() -> int:
         return 1
 
     events = build_turn_events(thread_id, 1, turns[0], fixture_path)
-    types = [e["body"].get("type") for e in events]
     check(sum(1 for e in events if e["type"] == "trace-create") == 1, "exactly one trace-create")
-    check(any(t == "SPAN" and e["body"].get("name") == "Turn 1" for e, t in zip(events, types)),
-          "root SPAN 'Turn 1' present")
+    # Typed envelopes only — classic observation-create/update drop environment
+    # and model (verified 2026-07-20 production Langfuse 4-way matrix).
+    check(all(e["type"] not in ("observation-create", "observation-update") for e in events),
+          "no classic observation-create/observation-update envelopes")
+    root_spans = [
+        e for e in events
+        if e["type"] in ("span-create", "span-update") and e["body"].get("name") == "Turn 1"
+    ]
+    check(len(root_spans) == 1, "root SPAN 'Turn 1' present (span-create)")
+    check(all("type" not in e["body"] for e in root_spans),
+          "span-create omits body.type (event type implies SPAN)")
 
     # Envelope type generation-create (not observation-create) is required so
     # Langfuse populates provided_model_name / providedModelName metrics.
@@ -2068,15 +2097,24 @@ def run_self_test() -> int:
     check(any(g["body"].get("usageDetails") for g in generations),
           "a generation-create carries usageDetails from token_count")
 
-    tool_spans = [e for e in events if e["body"].get("type") == "SPAN" and "tool_name" in (e["body"].get("metadata") or {})]
+    tool_spans = [
+        e for e in events
+        if e["type"] in ("span-create", "span-update")
+        and "tool_name" in (e["body"].get("metadata") or {})
+    ]
     check(len(tool_spans) >= 1, f"at least one tool SPAN (got {len(tool_spans)})")
     check(any(s["body"]["metadata"].get("tool_name") == "shell" for s in tool_spans),
           "a tool SPAN carries metadata.tool_name == 'shell'")
     check(any("hi" in (s["body"].get("output") or "") for s in tool_spans),
           "the shell tool SPAN's output includes the function_call_output text")
 
-    reasoning_events = [e for e in events if e["body"].get("type") == "EVENT" and e["body"].get("name") == "Reasoning"]
+    reasoning_events = [
+        e for e in events
+        if e["type"] == "event-create" and e["body"].get("name") == "Reasoning"
+    ]
     check(len(reasoning_events) >= 1, f"at least one reasoning EVENT (got {len(reasoning_events)})")
+    check(all("type" not in e["body"] for e in reasoning_events),
+          "event-create omits body.type (event type implies EVENT)")
 
     serialized = json.dumps(events)
     # Substring-match the JSON *key* (quoted, colon-terminated) rather than
