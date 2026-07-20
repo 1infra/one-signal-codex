@@ -1073,8 +1073,9 @@ def _observation_event(*, obs_id: str, trace_id: str, parent_id: Optional[str], 
                          input_: Any = None, output: Any = None, model: Optional[str] = None,
                          usage_details: Optional[Dict[str, int]] = None,
                          metadata: Optional[Dict[str, Any]] = None,
+                         level: Optional[str] = None,
                          event_type: str = "observation-create") -> Dict[str, Any]:
-    return _event_envelope(event_type, {
+    body: Dict[str, Any] = {
         "id": obs_id,
         "traceId": trace_id,
         "parentObservationId": parent_id,
@@ -1091,7 +1092,12 @@ def _observation_event(*, obs_id: str, trace_id: str, parent_id: Optional[str], 
         "model": model,
         "usageDetails": usage_details,
         "metadata": metadata,
-    })
+    }
+    # Langfuse observation level drives errorRate (share of level==ERROR).
+    # Only emit on real failures; omit entirely on success (do not send DEFAULT).
+    if level is not None:
+        body["level"] = level
+    return _event_envelope(event_type, body)
 
 def short_session_label(thread_id: str, max_len: int = 12) -> str:
     tid = thread_id.strip()
@@ -1401,6 +1407,21 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                 tc.get("input") if isinstance(tc.get("input"), str) else json.dumps(tc.get("input"), ensure_ascii=False) if tc.get("input") is not None else None
             )
             toutput, toutput_meta = truncate_text(tc.get("output"))
+            # Observation-level ERROR for failed tool SPANs (exec nonzero exit
+            # or result_status==error, including MCP Err). Success omits level.
+            exit_code = tc.get("exit_code")
+            tool_level = (
+                "ERROR"
+                if (
+                    (
+                        isinstance(exit_code, int)
+                        and not isinstance(exit_code, bool)
+                        and exit_code != 0
+                    )
+                    or tc.get("result_status") == "error"
+                )
+                else None
+            )
             events.append(_observation_event(
                 obs_id=f"{gen_id}-tool{t_idx + 1}",
                 trace_id=trace_id,
@@ -1423,6 +1444,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
                     "input_meta": tinput_meta,
                     "output_meta": toutput_meta,
                 },
+                level=tool_level,
                 event_type=observation_event_type,
             ))
 

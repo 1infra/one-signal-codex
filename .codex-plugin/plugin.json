@@ -1,6 +1,6 @@
 {
   "name": "one-signal-codex",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Trace OpenAI Codex CLI sessions to your One Infra organization via One Connector.",
   "author": {
     "name": "One Infra",

@@ -271,6 +271,77 @@ class TestParsingPipeline(unittest.TestCase):
 
         self.assertEqual(tool["metadata"]["result_status"], "error")
 
+    def test_failed_exec_tool_span_emits_observation_level_error(self):
+        # Nonzero structured exit_code must surface as Langfuse observation
+        # level=ERROR so the server's errorRate metric is non-zero for failures.
+        turn_id = "turn-exec-level-error"
+        meta = {"turn_id": turn_id}
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec", "call_id": "fail", "arguments": "{}", "internal_chat_message_metadata_passthrough": meta}}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "fail", "output": "{\"exit_code\":1,\"output\":\"boom\"}", "internal_chat_message_metadata_passthrough": meta}}, 3),
+            ({"timestamp": "2026-07-12T00:00:03Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id}}, 4),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+        body = next(
+            event["body"] for event in events
+            if (event["body"].get("metadata") or {}).get("tool_id") == "fail"
+        )
+
+        self.assertEqual(body["metadata"]["exit_code"], 1)
+        self.assertEqual(body["metadata"]["result_status"], "error")
+        self.assertEqual(body["level"], "ERROR")
+
+    def test_successful_exec_tool_span_omits_observation_level(self):
+        # Success must not send level at all (not even DEFAULT) so only real
+        # failures contribute to Langfuse errorRate.
+        turn_id = "turn-exec-level-ok"
+        meta = {"turn_id": turn_id}
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec", "call_id": "ok", "arguments": "{}", "internal_chat_message_metadata_passthrough": meta}}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "ok", "output": "{\"exit_code\":0,\"output\":\"done\"}", "internal_chat_message_metadata_passthrough": meta}}, 3),
+            ({"timestamp": "2026-07-12T00:00:03Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id}}, 4),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+        body = next(
+            event["body"] for event in events
+            if (event["body"].get("metadata") or {}).get("tool_id") == "ok"
+        )
+
+        self.assertEqual(body["metadata"]["exit_code"], 0)
+        self.assertEqual(body["metadata"]["result_status"], "success")
+        self.assertNotIn("level", body)
+
+    def test_mcp_error_tool_span_emits_observation_level_error(self):
+        # MCP Err results set result_status=error with no exit_code; the tool
+        # SPAN must still carry level=ERROR for errorRate accounting.
+        turn_id = "turn-mcp-level-error"
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "event_msg", "payload": {
+                "type": "mcp_tool_call_end",
+                "call_id": "mcp-level-error",
+                "invocation": {"server": "github", "tool": "search", "arguments": {}},
+                "result": {"Err": {"content": [{"type": "text", "text": "denied"}]}},
+            }}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id}}, 3),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+        body = next(
+            event["body"] for event in events
+            if (event["body"].get("metadata") or {}).get("tool_id") == "mcp-level-error"
+        )
+
+        self.assertEqual(body["metadata"]["result_status"], "error")
+        self.assertEqual(body["level"], "ERROR")
+
     def test_aborted_turn_is_emitted_as_completed_warning(self):
         turn_id = "turn-aborted"
         rows = [
