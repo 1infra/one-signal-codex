@@ -658,6 +658,184 @@ class TestStopHookEntrypoint(unittest.TestCase):
             self.assertEqual(final_entries[0]["partial_turn_ids"], [])
 
 
+class TestRedactText(unittest.TestCase):
+    """Pre-upload secret redaction (plugin-side, before ingest).
+
+    Covers known-format provider tokens, credentialed URIs, negatives,
+    idempotency, and one end-to-end path through build_turn_events.
+    """
+
+    # --- Positive: each known token class gets the right short tag ---
+
+    def test_aws_access_key_id(self):
+        raw = "creds AKIAIOSFODNN7EXAMPLE extra"
+        out = hook.redact_text(raw)
+        self.assertIn("<REDACTED:aws>", out)
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", out)
+
+    def test_github_pat_and_classic_token(self):
+        ghp = "ghp_" + ("a" * 36)
+        fine = "github_pat_" + ("b" * 22)
+        out = hook.redact_text(f"tokens {ghp} and {fine}")
+        self.assertEqual(out.count("<REDACTED:github>"), 2)
+        self.assertNotIn(ghp, out)
+        self.assertNotIn(fine, out)
+
+    def test_openai_style_sk_token(self):
+        tok = "sk-" + ("A" * 20)
+        out = hook.redact_text(f"key={tok}")
+        self.assertIn("<REDACTED:openai>", out)
+        self.assertNotIn(tok, out)
+
+    def test_slack_token(self):
+        tok = "xoxb-" + ("1" * 10)
+        out = hook.redact_text(f"auth {tok}")
+        self.assertIn("<REDACTED:slack>", out)
+        self.assertNotIn(tok, out)
+
+    def test_google_api_key(self):
+        tok = "AIza" + ("C" * 35)
+        out = hook.redact_text(tok)
+        self.assertEqual(out, "<REDACTED:google>")
+
+    def test_stripe_live_and_test_keys(self):
+        live = "sk_live_" + ("d" * 16)
+        test = "rk_test_" + ("e" * 16)
+        out = hook.redact_text(f"{live} {test}")
+        self.assertEqual(out.count("<REDACTED:stripe>"), 2)
+        self.assertNotIn(live, out)
+        self.assertNotIn(test, out)
+
+    def test_jwt(self):
+        # Three base64url segments; header typically starts with eyJ
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturexx"
+        out = hook.redact_text(f"Bearer {jwt}")
+        self.assertIn("<REDACTED:jwt>", out)
+        self.assertNotIn(jwt, out)
+
+    def test_pem_private_key_block(self):
+        pem = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF6P\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        out = hook.redact_text(f"key material:\n{pem}\ndone")
+        self.assertIn("<REDACTED:pem>", out)
+        self.assertNotIn("BEGIN RSA PRIVATE KEY", out)
+        self.assertNotIn("MIIEowIBAAKCAQEA", out)
+        self.assertIn("key material:", out)
+        self.assertIn("done", out)
+
+    def test_db_connection_string_masks_only_password(self):
+        raw = "postgres://alice:s3cret-pass@db.example.com:5432/app"
+        out = hook.redact_text(raw)
+        self.assertEqual(out, "postgres://alice:<REDACTED>@db.example.com:5432/app")
+        self.assertNotIn("s3cret-pass", out)
+
+    def test_mongodb_srv_and_redis_connection_strings(self):
+        mongo = "mongodb+srv://user:p%40ss@cluster0.example.net/db"
+        redis = "rediss://cache:hunter2@redis.internal:6380/0"
+        out = hook.redact_text(f"{mongo} | {redis}")
+        self.assertIn("mongodb+srv://user:<REDACTED>@cluster0.example.net/db", out)
+        self.assertIn("rediss://cache:<REDACTED>@redis.internal:6380/0", out)
+        self.assertNotIn("p%40ss", out)
+        self.assertNotIn("hunter2", out)
+
+    def test_generic_uri_with_embedded_password(self):
+        raw = "fetch https://deploy:topsecret@ci.example.com/hook"
+        out = hook.redact_text(raw)
+        self.assertEqual(out, "fetch https://deploy:<REDACTED>@ci.example.com/hook")
+        self.assertNotIn("topsecret", out)
+
+    # --- Negatives: lookalikes and non-credential URLs stay intact ---
+
+    def test_sk_lookalike_without_token_shape_unchanged(self):
+        # Word-boundary + length bounds must not fire on ordinary prose /
+        # skill-style names that merely contain the "sk-" substring.
+        prose = "skill-name-with-sk-prefix is fine; also mysk-not-a-token"
+        self.assertEqual(hook.redact_text(prose), prose)
+
+    def test_plain_url_without_password_unchanged(self):
+        url = "See https://example.com/path?q=1 and postgres://localhost/db"
+        self.assertEqual(hook.redact_text(url), url)
+
+    def test_aws_lookalike_wrong_length_unchanged(self):
+        # AKIA must be followed by exactly 16 alnum chars.
+        short = "AKIAIOSFODNN7EXAM"  # 15 after AKIA
+        longish = "AKIAIOSFODNN7EXAMPLEX"  # 17 after AKIA
+        self.assertEqual(hook.redact_text(short), short)
+        self.assertEqual(hook.redact_text(longish), longish)
+
+    # --- Idempotency: double-pass stable; never re-touch placeholders ---
+
+    def test_idempotent_double_pass(self):
+        raw = (
+            "aws=AKIAIOSFODNN7EXAMPLE "
+            "gh=ghp_" + ("x" * 36) + " "
+            "db=postgres://u:pw@h/db "
+            "https://a:b@host/z"
+        )
+        once = hook.redact_text(raw)
+        twice = hook.redact_text(once)
+        self.assertEqual(once, twice)
+        self.assertIn("<REDACTED:aws>", once)
+        self.assertIn("<REDACTED:github>", once)
+        self.assertIn("postgres://u:<REDACTED>@h/db", once)
+        self.assertIn("https://a:<REDACTED>@host/z", once)
+
+    def test_existing_placeholder_not_reprocessed(self):
+        # A placeholder must be left byte-for-byte alone even if its interior
+        # would otherwise look token-like; neighboring secrets still redact.
+        already = "prev <REDACTED:aws> mid AKIAIOSFODNN7EXAMPLE end"
+        out = hook.redact_text(already)
+        self.assertEqual(out, "prev <REDACTED:aws> mid <REDACTED:aws> end")
+
+    # --- End-to-end: real pipeline masks secrets in tool span body ---
+
+    def test_tool_span_body_redacts_secret_via_pipeline(self):
+        turn_id = "turn-redact-e2e"
+        meta = {"turn_id": turn_id}
+        secret = "sk-" + ("Z" * 24)
+        tool_out = f'{{"exit_code":0,"output":"token {secret} ok"}}'
+        rows = [
+            ({"timestamp": "2026-07-12T00:00:00Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}}, 1),
+            ({"timestamp": "2026-07-12T00:00:01Z", "type": "event_msg", "payload": {
+                "type": "user_message", "message": f"use key {secret}",
+            }}, 2),
+            ({"timestamp": "2026-07-12T00:00:02Z", "type": "response_item", "payload": {
+                "type": "function_call", "name": "shell", "call_id": "redact-1",
+                "arguments": json.dumps({"command": f"echo {secret}"}),
+                "internal_chat_message_metadata_passthrough": meta,
+            }}, 3),
+            ({"timestamp": "2026-07-12T00:00:03Z", "type": "response_item", "payload": {
+                "type": "function_call_output", "call_id": "redact-1",
+                "output": tool_out,
+                "internal_chat_message_metadata_passthrough": meta,
+            }}, 4),
+            ({"timestamp": "2026-07-12T00:00:04Z", "type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": turn_id,
+                "last_agent_message": f"done with {secret}",
+            }}, 5),
+        ]
+
+        turn = hook.build_turns(rows)[0]
+        events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+        tool_body = next(
+            event["body"] for event in events
+            if (event["body"].get("metadata") or {}).get("tool_id") == "redact-1"
+        )
+        trace = next(event["body"] for event in events if event["type"] == "trace-create")
+
+        self.assertNotIn(secret, tool_body.get("input") or "")
+        self.assertNotIn(secret, tool_body.get("output") or "")
+        self.assertIn("<REDACTED:openai>", tool_body.get("input") or "")
+        self.assertIn("<REDACTED:openai>", tool_body.get("output") or "")
+        # User + final assistant free-text on the trace must also be masked.
+        self.assertNotIn(secret, (trace.get("input") or {}).get("content") or "")
+        self.assertNotIn(secret, (trace.get("output") or {}).get("content") or "")
+        self.assertIn("<REDACTED:openai>", (trace.get("input") or {}).get("content") or "")
+
+
 class TestPluginHookConfiguration(unittest.TestCase):
     def test_marketplace_local_source_uses_relative_path(self):
         config_path = Path(__file__).resolve().parent / ".agents" / "plugins" / "marketplace.json"

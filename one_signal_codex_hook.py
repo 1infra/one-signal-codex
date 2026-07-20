@@ -560,6 +560,74 @@ def truncate_text(s: Optional[str], max_chars: int = MAX_CHARS) -> Tuple[str, Di
         "sha256": hashlib.sha256(s.encode("utf-8")).hexdigest(),
     }
 
+
+# ----------------- Pre-upload secret redaction (plugin-side) -----------------
+# Light, low-false-positive masking so plaintext secrets never leave the
+# machine. Server-side redaction remains defense-in-depth on READ. v1 covers
+# known-format provider tokens + credentialed URIs only -- no entropy scan.
+
+_REDACTED_PLACEHOLDER_RE = re.compile(r"<REDACTED(?::[^>]*)?>")
+
+# PEM first (multiline), then length-bounded provider tokens, then URI passwords.
+_REDACT_PEM_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+_REDACT_TOKEN_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<REDACTED:aws>"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}\b"), "<REDACTED:github>"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,255}\b"), "<REDACTED:github>"),
+    # Stripe before generic sk- so sk_live_/sk_test_ never fall into openai.
+    (re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"), "<REDACTED:stripe>"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), "<REDACTED:openai>"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "<REDACTED:slack>"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "<REDACTED:google>"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b"),
+     "<REDACTED:jwt>"),
+)
+# Mask only the password segment; keep scheme/user/host for debugging.
+_REDACT_DB_URI_RE = re.compile(
+    r"((?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|rediss|amqp)://"
+    r"[^:/\s]+):([^@\s]+)@"
+)
+_REDACT_GENERIC_URI_RE = re.compile(
+    r"([a-z][a-z0-9+.-]*://[^:/\s]+):([^@\s]+)@"
+)
+
+
+def _redact_unprotected_segment(segment: str) -> str:
+    """Apply all v1 secret patterns to a slice that is known not to sit inside
+    an existing <REDACTED...> placeholder."""
+    if not segment:
+        return segment
+    out = _REDACT_PEM_RE.sub("<REDACTED:pem>", segment)
+    for pattern, replacement in _REDACT_TOKEN_PATTERNS:
+        out = pattern.sub(replacement, out)
+    out = _REDACT_DB_URI_RE.sub(r"\1:<REDACTED>@", out)
+    out = _REDACT_GENERIC_URI_RE.sub(r"\1:<REDACTED>@", out)
+    return out
+
+
+def redact_text(s: str) -> str:
+    """Mask known-format secrets in free text before they enter an ingest body.
+
+    Idempotent: already-redacted placeholders are never reprocessed, and a
+    second pass on the result is a no-op. Password-bearing URIs keep user and
+    host readable (scheme://user:<REDACTED>@host).
+    """
+    if not s:
+        return s
+    # Split on existing placeholders so their interiors are never re-scanned
+    # (and so a double-pass cannot nest or reshape them).
+    parts: List[str] = []
+    last = 0
+    for match in _REDACTED_PLACEHOLDER_RE.finditer(s):
+        parts.append(_redact_unprotected_segment(s[last:match.start()]))
+        parts.append(match.group(0))
+        last = match.end()
+    parts.append(_redact_unprotected_segment(s[last:]))
+    return "".join(parts)
+
 def parse_timestamp(value: Any) -> Optional[datetime]:
     if isinstance(value, dict):
         value = value.get("timestamp")
@@ -1263,11 +1331,14 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
     EVENTs)."""
     events: List[Dict[str, Any]] = []
 
-    user_text, user_text_meta = truncate_text(turn.user_text)
+    # Redact free-text before truncate/upload so plaintext secrets never leave
+    # the machine. Do not apply to ids, timestamps, model, usage, metadata keys,
+    # or instruction_documents (those keep their own handling).
+    user_text, user_text_meta = truncate_text(redact_text(turn.user_text or ""))
     final_text_raw = turn.last_agent_message or (
         turn.rounds[-1].assistant_texts[-1][0] if turn.rounds and turn.rounds[-1].assistant_texts else ""
     )
-    final_text, _ = truncate_text(final_text_raw)
+    final_text, _ = truncate_text(redact_text(final_text_raw or ""))
 
     turn_end_ts = turn.completed_ts or turn.last_event_ts
     turn_metadata: Dict[str, Any] = {
@@ -1339,7 +1410,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
         gen_id = f"{root_obs_id}-gen{r_idx + 1}"
 
         am_texts = [t for t, _ in rnd.assistant_texts if t]
-        am_text, am_text_meta = truncate_text("\n\n".join(am_texts))
+        am_text, am_text_meta = truncate_text(redact_text("\n\n".join(am_texts)))
         am_ts = rnd.assistant_texts[-1][1] if rnd.assistant_texts else (rnd.reasoning_ts or prev_ts)
 
         gen_output: Dict[str, Any] = {"role": "assistant"}
@@ -1384,6 +1455,8 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
             # build/config (both observed against real rollouts) --
             # extract_text() handles either shape.
             summary_text = extract_text(rnd.reasoning.get("summary")) or None
+            if summary_text:
+                summary_text = redact_text(summary_text)
             events.append(_observation_event(
                 obs_id=f"{gen_id}-reasoning",
                 trace_id=trace_id,
@@ -1403,10 +1476,18 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
             ))
 
         for t_idx, tc in enumerate(rnd.tool_calls):
-            tinput, tinput_meta = truncate_text(
-                tc.get("input") if isinstance(tc.get("input"), str) else json.dumps(tc.get("input"), ensure_ascii=False) if tc.get("input") is not None else None
+            raw_tinput = (
+                tc.get("input") if isinstance(tc.get("input"), str)
+                else json.dumps(tc.get("input"), ensure_ascii=False) if tc.get("input") is not None
+                else None
             )
-            toutput, toutput_meta = truncate_text(tc.get("output"))
+            tinput, tinput_meta = truncate_text(
+                redact_text(raw_tinput) if raw_tinput else raw_tinput
+            )
+            raw_toutput = tc.get("output")
+            toutput, toutput_meta = truncate_text(
+                redact_text(raw_toutput) if isinstance(raw_toutput, str) and raw_toutput else raw_toutput
+            )
             # Observation-level ERROR for failed tool SPANs (exec nonzero exit
             # or result_status==error, including MCP Err). Success omits level.
             exit_code = tc.get("exit_code")
