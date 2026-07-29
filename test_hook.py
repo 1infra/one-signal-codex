@@ -164,6 +164,41 @@ class TestParsingPipeline(unittest.TestCase):
                 "content_hash": hashlib.sha256(b"project agents").hexdigest(),
             })
 
+    def test_instruction_snapshot_hashes_raw_content_but_otlp_contains_only_redacted_content(self):
+        secret = "sk-" + ("A" * 20)
+        raw_content = f"Use token={secret} for local testing"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            project = home / "project"
+            (project / ".git").mkdir(parents=True)
+            (home / ".codex").mkdir()
+            (project / "AGENTS.md").write_text(raw_content, encoding="utf-8")
+            turn = copy.deepcopy(self.turns[0])
+            turn.cwd = str(project)
+
+            with (
+                mock.patch.object(hook, "CODEX_HOME", home / ".codex"),
+                mock.patch.object(hook.Path, "home", return_value=home),
+            ):
+                events = hook.build_turn_events(THREAD_ID, 1, turn, FIXTURE)
+
+        spans = [span for span, _source in hook._classic_events_to_otlp(events)]
+        root = next(span for span in spans if "parentSpanId" not in span)
+        attributes = {
+            entry["key"]: entry["value"] for entry in root["attributes"]
+        }
+        metadata = json.loads(attributes["one.signal.metadata"]["stringValue"])
+        document = metadata["instruction_documents"][0]
+        self.assertEqual(
+            document["content_hash"],
+            hashlib.sha256(raw_content.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(
+            document["content"],
+            "Use token=<REDACTED:openai> for local testing",
+        )
+        self.assertNotIn(secret, json.dumps(spans))
+
     def test_later_turn_uploads_only_new_nested_instruction_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -532,6 +567,120 @@ class TestChunking(unittest.TestCase):
 
 
 class TestTransport(unittest.TestCase):
+    @staticmethod
+    def events():
+        return [
+            {
+                "id": "trace-envelope",
+                "timestamp": "2026-07-12T00:00:00.000Z",
+                "type": "trace-create",
+                "body": {
+                    "id": "trace-a",
+                    "timestamp": "2026-07-12T00:00:00.000Z",
+                    "name": "Codex CLI - Turn 1",
+                    "sessionId": "thread-a",
+                    "userId": "configured-codex-user",
+                    "metadata": {"source": "codex-cli"},
+                    "tags": ["codex-cli"],
+                },
+            },
+            {
+                "id": "root-envelope",
+                "timestamp": "2026-07-12T00:00:01.000Z",
+                "type": "span-create",
+                "body": {
+                    "id": "root-a",
+                    "traceId": "trace-a",
+                    "name": "Turn 1",
+                    "startTime": "2026-07-12T00:00:00.000Z",
+                    "endTime": "2026-07-12T00:00:01.000Z",
+                },
+            },
+            {
+                "id": "gen-envelope",
+                "timestamp": "2026-07-12T00:00:01.000Z",
+                "type": "generation-create",
+                "body": {
+                    "id": "gen-a",
+                    "traceId": "trace-a",
+                    "parentObservationId": "root-a",
+                    "name": "Codex Generation 1",
+                    "startTime": "2026-07-12T00:00:00.000Z",
+                    "endTime": "2026-07-12T00:00:01.000Z",
+                    "model": "gpt-test",
+                    "usageDetails": {
+                        "input": 12,
+                        "output": 3,
+                        "reasoning_output_tokens": 2,
+                    },
+                    "metadata": {"provider": "openai"},
+                },
+            },
+        ]
+
+    def test_posts_otlp_json_with_basic_auth(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return b"{}"
+
+        with mock.patch.object(
+            hook.urllib.request,
+            "urlopen",
+            return_value=Response(),
+        ) as urlopen:
+            accepted = hook.post_batch(
+                self.events(),
+                "https://example.test",
+                "oc_test",
+                {"sdk_name": "one-signal-codex-hook"},
+            )
+
+        self.assertTrue(accepted)
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "https://example.test/api/public/otel/v1/traces",
+        )
+        self.assertEqual(request.get_header("Authorization"), "Basic b2NfdGVzdDo=")
+        payload = json.loads(request.data)
+        self.assertNotIn("batch", payload)
+        spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(spans[0]["traceId"], "d5b56921fb1155c8e07a80bcfae224b5")
+        self.assertEqual(spans[1]["parentSpanId"], "0a16c2d64ed82e34")
+        root_attributes = {
+            entry["key"]: entry["value"] for entry in spans[0]["attributes"]
+        }
+        self.assertEqual(
+            root_attributes["one.signal.configured_user_id"]["stringValue"],
+            "configured-codex-user",
+        )
+        self.assertNotIn("user.id", root_attributes)
+        generation_attributes = {
+            entry["key"]: entry["value"] for entry in spans[1]["attributes"]
+        }
+        self.assertEqual(
+            generation_attributes["gen_ai.system"]["stringValue"],
+            "openai",
+        )
+        self.assertEqual(
+            generation_attributes["gen_ai.usage.reasoning_tokens"]["intValue"],
+            "2",
+        )
+        self.assertEqual(
+            generation_attributes["one.signal.agent"]["stringValue"],
+            "codex-cli",
+        )
+
     def test_transient_network_error_retries_before_succeeding(self):
         class Response:
             def __enter__(self):
@@ -555,7 +704,7 @@ class TestTransport(unittest.TestCase):
             mock.patch.object(hook.time, "sleep"),
         ):
             accepted = hook.post_batch(
-                [{"id": "event-1", "type": "trace-create", "body": {}}],
+                self.events(),
                 "https://example.test",
                 "oc_test",
                 {},
@@ -563,6 +712,67 @@ class TestTransport(unittest.TestCase):
 
         self.assertTrue(accepted)
         self.assertEqual(urlopen.call_count, 2)
+
+    def test_permanent_4xx_is_not_retried_or_acknowledged(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def getcode(self):
+                return 400
+
+            def read(self):
+                return b'{"error":"invalid"}'
+
+        with mock.patch.object(
+            hook.urllib.request,
+            "urlopen",
+            return_value=Response(),
+        ) as urlopen:
+            accepted = hook.post_batch(
+                self.events(),
+                "https://example.test",
+                "oc_test",
+                {},
+            )
+
+        self.assertFalse(accepted)
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_chunks_exact_otlp_json_by_span_count_and_final_bytes(self):
+        metadata = {"sdk_name": "one-signal-codex-hook"}
+        span = {
+            "traceId": "0" * 32,
+            "spanId": "0" * 16,
+            "name": "x",
+            "kind": 1,
+            "startTimeUnixNano": "1",
+            "endTimeUnixNano": "2",
+            "attributes": [],
+        }
+        groups = hook._chunk_span_indices([span] * 201, metadata)
+        self.assertEqual([len(group) for group in groups], [200, 1])
+
+        two_span_bytes = len(hook._otlp_payload([span, span], metadata))
+        groups = hook._chunk_span_indices(
+            [span, span],
+            metadata,
+            max_bytes=two_span_bytes - 1,
+        )
+        self.assertEqual(groups, [[0], [1]])
+        self.assertTrue(
+            all(
+                len(hook._otlp_payload([span for _ in group], metadata))
+                <= two_span_bytes - 1
+                for group in groups
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "single OTLP span"):
+            hook._chunk_span_indices([span], metadata, max_bytes=1)
 
 
 class TestSelfTestEntrypoint(unittest.TestCase):

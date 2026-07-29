@@ -2,11 +2,11 @@
 """
 Codex CLI -> One Signal (via One Connector) hook.
 
-Sibling of ../one-signal (the Claude Code plugin). Same destination, same
-Langfuse *classic ingestion* wire format, same One Connector access-token
-transport -- this file is a fresh implementation because Codex's session
-data model is unrelated to Claude Code's transcript format (see below), not
-a derivative of the Claude hook's parsing code.
+Sibling of ../one-signal (the Claude Code plugin). It keeps compatible
+classic event dictionaries internally, then converts them to OTLP/JSON at
+the One Connector transport boundary. This file is a fresh implementation
+because Codex's session data model is unrelated to Claude Code's transcript
+format (see below), not a derivative of the Claude hook's parsing code.
 
 --------------------------------------------------------------------------
 How Codex invokes this
@@ -185,6 +185,7 @@ awaited), but exiting 0 defensively means a bug here can never surface as a
 Codex-visible error either way.
 """
 
+import base64
 import hashlib
 import json
 import logging
@@ -201,7 +202,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-PLUGIN_VERSION = "0.1.15"
+PLUGIN_VERSION = "0.1.16"
 
 # --- Paths ---
 def _codex_home() -> Path:
@@ -228,8 +229,7 @@ try:
 except ValueError:
     MAX_CHARS = 20000
 
-# Server-side caps for the ingest proxy (same proxy, same caps as the Claude
-# hook -- mirrors Langfuse's own /api/public/ingestion batch-size limits).
+# One Connector OTLP/HTTP request caps.
 MAX_EVENTS_PER_BATCH = 200
 MAX_BYTES_PER_BATCH = 3_500_000
 MAX_INSTRUCTION_DOCUMENTS = 20
@@ -1484,7 +1484,7 @@ def collect_instruction_documents(
             "path": label,
             "scope": scope,
             "directory_scope": directory_scope,
-            "content": content,
+            "content": redact_text(content),
             "content_hash": content_hash,
         })
         if len(known) >= MAX_INSTRUCTION_DOCUMENTS:
@@ -1537,7 +1537,7 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
 
     # Redact free-text before truncate/upload so plaintext secrets never leave
     # the machine. Do not apply to ids, timestamps, model, usage, metadata keys,
-    # or instruction_documents (those keep their own handling).
+    # or instruction_documents (their content is redacted after raw-content hashing).
     user_text, user_text_meta = truncate_text(redact_text(turn.user_text or ""))
     final_text_raw = turn.last_agent_message or (
         turn.rounds[-1].assistant_texts[-1][0] if turn.rounds and turn.rounds[-1].assistant_texts else ""
@@ -1739,7 +1739,306 @@ def build_turn_events(thread_id: str, turn_num: int, turn: Turn, rollout_path: P
 
     return events
 
-# ----------------- Chunking (identical to ../one-signal) -----------------
+# ----------------- OTLP/JSON conversion -----------------
+# Parsing keeps the existing classic-event intermediate representation. The
+# transport boundary below is the only place coupled to the OTLP wire format.
+
+def _stable_trace_id(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def _stable_span_id(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _unix_nano(value: Any) -> str:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        parsed = datetime.now(timezone.utc)
+    elif parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    delta = parsed - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return str((delta.days * 86_400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1_000)
+
+
+def _json_attr_value(value: Any) -> Dict[str, Any]:
+    if isinstance(value, bool):
+        return {"boolValue": value}
+    if isinstance(value, int):
+        return {"intValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    if isinstance(value, list):
+        return {"arrayValue": {"values": [_json_attr_value(item) for item in value]}}
+    return {"stringValue": str(value)}
+
+
+def _io_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _append_attr(attributes: List[Dict[str, Any]], key: str, value: Any) -> None:
+    if value is None or value == "" or value == []:
+        return
+    attributes.append({"key": key, "value": _json_attr_value(value)})
+
+
+def _classic_events_to_otlp(
+    events: List[Dict[str, Any]],
+) -> List[Tuple[Dict[str, Any], int]]:
+    """Convert classic internal events to complete OTLP spans.
+
+    The source index keeps checkpoint attribution aligned after trace-create
+    is merged into its root span.
+    """
+    trace_bodies: Dict[str, Dict[str, Any]] = {}
+    trace_sources: Dict[str, int] = {}
+    rooted_trace_ids: set[str] = set()
+    for index, event in enumerate(events):
+        body = event.get("body")
+        if not isinstance(body, dict):
+            continue
+        if event.get("type") == "trace-create":
+            trace_id = body.get("id")
+            if isinstance(trace_id, str) and trace_id:
+                trace_bodies[trace_id] = body
+                trace_sources[trace_id] = index
+            continue
+        trace_id = body.get("traceId")
+        if (
+            isinstance(trace_id, str)
+            and trace_id
+            and not body.get("parentObservationId")
+            and (
+                event.get("type") in ("span-create", "span-update")
+                or body.get("type") == "SPAN"
+            )
+        ):
+            rooted_trace_ids.add(trace_id)
+
+    converted: List[Tuple[Dict[str, Any], int]] = []
+
+    def convert_body(
+        body: Dict[str, Any],
+        envelope_timestamp: Any,
+        source_index: int,
+        trace_body: Optional[Dict[str, Any]],
+        synthetic_root: bool = False,
+    ) -> None:
+        raw_trace_id = body.get("traceId") or body.get("id")
+        raw_span_id = body.get("id")
+        if not isinstance(raw_trace_id, str) or not raw_trace_id:
+            raise ValueError("OTLP span is missing trace identity")
+        if not isinstance(raw_span_id, str) or not raw_span_id:
+            raise ValueError("OTLP span is missing span identity")
+
+        is_root = synthetic_root or not body.get("parentObservationId")
+        trace_metadata = trace_body.get("metadata") if isinstance(trace_body, dict) else None
+        body_metadata = body.get("metadata")
+        metadata: Dict[str, Any] = {}
+        if is_root and isinstance(trace_metadata, dict):
+            metadata.update(trace_metadata)
+        if isinstance(body_metadata, dict):
+            metadata.update(body_metadata)
+
+        attributes: List[Dict[str, Any]] = []
+        session_id = trace_body.get("sessionId") if isinstance(trace_body, dict) else None
+        _append_attr(attributes, "session.id", session_id)
+        configured_user_id = trace_body.get("userId") if isinstance(trace_body, dict) else None
+        _append_attr(
+            attributes,
+            "one.signal.configured_user_id",
+            configured_user_id,
+        )
+        source = metadata.get("source")
+        if not source and isinstance(trace_metadata, dict):
+            source = trace_metadata.get("source")
+        _append_attr(attributes, "one.signal.agent", source)
+
+        event_type = str(body.get("_event_type") or "")
+        observation_type = str(body.get("type") or "")
+        tool_name = metadata.get("tool_name")
+        mcp_server = metadata.get("mcp_server")
+        mcp_tool = metadata.get("mcp_tool")
+        if mcp_server:
+            span_type = "mcp"
+        elif tool_name:
+            span_type = "tool"
+        elif "generation" in event_type or observation_type == "GENERATION" or body.get("model"):
+            span_type = "generation"
+        elif "event" in event_type or observation_type == "EVENT":
+            span_type = "event"
+        elif is_root and source:
+            span_type = "agent"
+        else:
+            span_type = "general"
+        _append_attr(attributes, "one.signal.span_type", span_type)
+
+        input_value = body.get("input")
+        output_value = body.get("output")
+        if is_root and isinstance(trace_body, dict):
+            if input_value is None:
+                input_value = trace_body.get("input")
+            if output_value is None:
+                output_value = trace_body.get("output")
+        _append_attr(attributes, "gen_ai.prompt", _io_string(input_value))
+        _append_attr(attributes, "gen_ai.completion", _io_string(output_value))
+
+        _append_attr(attributes, "gen_ai.request.model", body.get("model"))
+        _append_attr(attributes, "gen_ai.system", body.get("provider") or metadata.get("provider"))
+
+        usage = body.get("usageDetails")
+        if isinstance(usage, dict):
+            usage_keys = {
+                "input": "gen_ai.usage.input_tokens",
+                "output": "gen_ai.usage.output_tokens",
+                "total": "gen_ai.usage.total_tokens",
+                "cache_read_input_tokens": "gen_ai.usage.cache_read_input_tokens",
+                "cache_creation_input_tokens": "gen_ai.usage.cache_creation_input_tokens",
+                "cache_write_input_tokens": "gen_ai.usage.cache_creation_input_tokens",
+                "reasoning": "gen_ai.usage.reasoning_tokens",
+                "reasoning_output_tokens": "gen_ai.usage.reasoning_tokens",
+            }
+            for key, attribute_key in usage_keys.items():
+                value = usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    _append_attr(attributes, attribute_key, value)
+
+        costs = body.get("costDetails")
+        if isinstance(costs, dict):
+            for key, value in costs.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    _append_attr(attributes, f"one.signal.cost.{key}", value)
+
+        _append_attr(attributes, "gen_ai.tool.name", mcp_tool or tool_name)
+        _append_attr(attributes, "one.signal.mcp.server", mcp_server)
+        if is_root and isinstance(trace_body, dict):
+            _append_attr(attributes, "1infra.tags", trace_body.get("tags"))
+
+        _append_attr(
+            attributes,
+            "one.signal.session_end_reason",
+            metadata.get("session_end_reason"),
+        )
+        completed = metadata.get("completed")
+        if isinstance(completed, bool):
+            _append_attr(attributes, "one.signal.completed", completed)
+        if metadata:
+            _append_attr(
+                attributes,
+                "one.signal.metadata",
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+            )
+
+        start = body.get("startTime")
+        if start is None and isinstance(trace_body, dict):
+            start = trace_body.get("timestamp")
+        start = start or envelope_timestamp
+        end = body.get("endTime") or start
+        span: Dict[str, Any] = {
+            "traceId": _stable_trace_id(raw_trace_id),
+            "spanId": _stable_span_id(raw_span_id),
+            "name": (
+                trace_body.get("name")
+                if is_root and isinstance(trace_body, dict) and trace_body.get("name")
+                else body.get("name") or "unnamed"
+            ),
+            "kind": 1,
+            "startTimeUnixNano": _unix_nano(start),
+            "endTimeUnixNano": _unix_nano(end),
+            "attributes": attributes,
+        }
+        parent_id = body.get("parentObservationId")
+        if isinstance(parent_id, str) and parent_id:
+            span["parentSpanId"] = _stable_span_id(parent_id)
+        if body.get("level") == "ERROR" or metadata.get("result_status") == "error":
+            span["status"] = {"code": 2}
+        converted.append((span, source_index))
+
+    for index, event in enumerate(events):
+        if event.get("type") == "trace-create":
+            continue
+        body = event.get("body")
+        if not isinstance(body, dict):
+            raise ValueError("classic event body must be an object")
+        trace_id = body.get("traceId")
+        trace_body = trace_bodies.get(trace_id) if isinstance(trace_id, str) else None
+        event_body = dict(body)
+        event_body["_event_type"] = event.get("type")
+        convert_body(event_body, event.get("timestamp"), index, trace_body)
+
+    for trace_id, trace_body in trace_bodies.items():
+        if trace_id in rooted_trace_ids:
+            continue
+        synthetic = dict(trace_body)
+        synthetic["id"] = f"{trace_id}:root"
+        synthetic["traceId"] = trace_id
+        synthetic["_event_type"] = "trace-create"
+        convert_body(
+            synthetic,
+            trace_body.get("timestamp"),
+            trace_sources[trace_id],
+            trace_body,
+            synthetic_root=True,
+        )
+    return converted
+
+
+def _otlp_payload(spans: List[Dict[str, Any]], metadata: Dict[str, Any]) -> bytes:
+    sdk_name = str(metadata.get("sdk_name") or "one-signal-codex-hook")
+    sdk_version = str(metadata.get("sdk_version") or PLUGIN_VERSION)
+    payload = {
+        "resourceSpans": [
+            {
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": sdk_name}},
+                        {"key": "service.version", "value": {"stringValue": sdk_version}},
+                    ]
+                },
+                "scopeSpans": [
+                    {
+                        "scope": {"name": sdk_name, "version": sdk_version},
+                        "spans": spans,
+                    }
+                ],
+            }
+        ]
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _chunk_span_indices(
+    spans: List[Dict[str, Any]],
+    metadata: Dict[str, Any],
+    max_events: int = MAX_EVENTS_PER_BATCH,
+    max_bytes: int = MAX_BYTES_PER_BATCH,
+) -> List[List[int]]:
+    groups: List[List[int]] = []
+    current: List[int] = []
+    for index in range(len(spans)):
+        candidate = current + [index]
+        size = len(_otlp_payload([spans[i] for i in candidate], metadata))
+        if current and (len(candidate) > max_events or size > max_bytes):
+            groups.append(current)
+            current = [index]
+            if len(_otlp_payload([spans[index]], metadata)) > max_bytes:
+                raise ValueError("single OTLP span exceeds request byte limit")
+        else:
+            if not current and size > max_bytes:
+                raise ValueError("single OTLP span exceeds request byte limit")
+            current = candidate
+    if current:
+        groups.append(current)
+    return groups
+
+
+# ----------------- Legacy helper retained for callers/tests -----------------
 def _event_size_bytes(event: Dict[str, Any]) -> int:
     return len(json.dumps(event, ensure_ascii=False).encode("utf-8"))
 
@@ -1765,30 +2064,19 @@ def chunk_indices(events: List[Dict[str, Any]], max_events: int = MAX_EVENTS_PER
 
     return groups
 
-# ----------------- Transport (identical to ../one-signal) -----------------
-def _extract_ingestion_errors(body: bytes) -> List[Dict[str, Any]]:
-    try:
-        parsed = json.loads(body.decode("utf-8", errors="replace"))
-    except Exception:
-        return []
-    if not isinstance(parsed, dict):
-        return []
-    errors = parsed.get("errors")
-    if not isinstance(errors, list):
-        return []
-    return [e for e in errors if isinstance(e, dict)]
-
-def _post_batch_once(events: List[Dict[str, Any]], base_url: str, api_token: str,
-                     metadata: Dict[str, Any]) -> Tuple[bool, bool]:
+# ----------------- Transport -----------------
+def _post_otlp_once(spans: List[Dict[str, Any]], base_url: str, api_token: str,
+                    metadata: Dict[str, Any]) -> Tuple[bool, bool]:
     """Return (accepted, retryable)."""
-    url = base_url.rstrip("/") + "/api/v1/observe/ingest"
-    payload = json.dumps({"batch": events, "metadata": metadata}, ensure_ascii=False).encode("utf-8")
+    url = base_url.rstrip("/") + "/api/public/otel/v1/traces"
+    payload = _otlp_payload(spans, metadata)
+    basic = base64.b64encode(f"{api_token}:".encode("utf-8")).decode("ascii")
     req = urllib.request.Request(
         url,
         data=payload,
         method="POST",
         headers={
-            "Authorization": f"Bearer {api_token}",
+            "Authorization": f"Basic {basic}",
             "Content-Type": "application/json",
         },
     )
@@ -1796,40 +2084,24 @@ def _post_batch_once(events: List[Dict[str, Any]], base_url: str, api_token: str
         with urllib.request.urlopen(req, timeout=8) as resp:
             status = resp.getcode()
             body = resp.read()
-            if status == 207:
-                errors = _extract_ingestion_errors(body)
-                for err in errors:
-                    warning(
-                        "ingest event failed: "
-                        f"id={err.get('id')} status={err.get('status')} message={err.get('message')}"
-                    )
-                debug(f"ingest ok: status={status} events={len(events)} failed={len(errors)}")
-                return len(errors) == 0, False
-            elif 200 <= status < 300:
-                debug(f"ingest ok: status={status} events={len(events)}")
+            if 200 <= status < 300:
+                debug(f"ingest ok: status={status} spans={len(spans)}")
                 return True, False
-            else:
-                info(f"ingest unexpected status {status}: {body[:500]!r}")
-                return False, status == 429 or status >= 500
+            if status == 429 or status >= 500:
+                debug(f"ingest retryable HTTP {status}: {body[:500]!r}")
+                return False, True
+            info(f"ingest rejected permanently: HTTP {status}: {body[:500]!r}")
+            return False, False
     except urllib.error.HTTPError as e:
         body = e.read()
-        if e.code == 503:
-            code = None
-            try:
-                parsed = json.loads(body.decode("utf-8", errors="replace"))
-                if isinstance(parsed, dict):
-                    err = parsed.get("error")
-                    code = err.get("code") if isinstance(err, dict) else err
-            except Exception:
-                pass
-            if code == "signal_not_configured":
-                debug(
-                    "One Signal is not connected for this organization yet -- "
-                    "connect Langfuse in Console -> Integrations. Dropping this batch."
-                )
-                return False, False
-        info(f"ingest failed: HTTP {e.code}: {body[:500]!r}")
-        return False, e.code == 429 or e.code >= 500
+        if e.code in (401, 403):
+            info(f"ingest authentication failed permanently: HTTP {e.code}")
+            return False, False
+        if e.code == 429 or e.code >= 500:
+            debug(f"ingest retryable HTTP {e.code}: {body[:500]!r}")
+            return False, True
+        info(f"ingest rejected permanently: HTTP {e.code}: {body[:500]!r}")
+        return False, False
     except urllib.error.URLError as e:
         debug(f"ingest network error: {e}")
         return False, True
@@ -1838,38 +2110,60 @@ def _post_batch_once(events: List[Dict[str, Any]], base_url: str, api_token: str
         return False, False
 
 
-def post_batch(events: List[Dict[str, Any]], base_url: str, api_token: str,
+def _post_otlp(spans: List[Dict[str, Any]], base_url: str, api_token: str,
                metadata: Dict[str, Any]) -> bool:
     for attempt, delay in enumerate((0, 0.25, 0.75)):
         if delay:
             time.sleep(delay)
-        accepted, retryable = _post_batch_once(events, base_url, api_token, metadata)
+        accepted, retryable = _post_otlp_once(spans, base_url, api_token, metadata)
         if accepted:
             return True
-        if not retryable:
-            return False
-        if attempt == 2:
+        if not retryable or attempt == 2:
             return False
         debug(f"retrying ingest after transient failure (attempt {attempt + 2}/3)")
     return False
 
+
+def post_batch(events: List[Dict[str, Any]], base_url: str, api_token: str,
+               metadata: Dict[str, Any]) -> bool:
+    try:
+        spans = [span for span, _source in _classic_events_to_otlp(events)]
+    except Exception as e:
+        info(f"OTLP conversion failed permanently: {type(e).__name__}: {e}")
+        return False
+    return _post_otlp(spans, base_url, api_token, metadata)
+
 def deliver(events: List[Dict[str, Any]], event_turn_idx: List[int], base_url: str, api_token: str) -> set:
-    chunk_idx_groups = chunk_indices(events)
-    debug(f"delivering {len(events)} events in {len(chunk_idx_groups)} chunk(s)")
+    try:
+        converted = _classic_events_to_otlp(events)
+    except Exception as e:
+        info(f"OTLP conversion failed permanently: {type(e).__name__}: {e}")
+        return set()
+    spans = [span for span, _source in converted]
+    span_turn_idx = [event_turn_idx[source] for _span, source in converted]
+    request_metadata = {
+        "sdk_name": "one-signal-codex-hook",
+        "sdk_version": PLUGIN_VERSION,
+    }
+    try:
+        chunk_idx_groups = _chunk_span_indices(spans, request_metadata)
+    except ValueError as e:
+        info(f"OTLP chunking failed permanently: {e}")
+        return set()
+    debug(f"delivering {len(spans)} spans in {len(chunk_idx_groups)} chunk(s)")
 
     turn_ok: Dict[int, bool] = {}
     for i, idx_group in enumerate(chunk_idx_groups):
-        chunk = [events[j] for j in idx_group]
-        fully_accepted = post_batch(chunk, base_url, api_token, metadata={
-            "sdk_name": "one-signal-codex-hook",
-            "sdk_version": PLUGIN_VERSION,
+        chunk = [spans[j] for j in idx_group]
+        fully_accepted = _post_otlp(chunk, base_url, api_token, metadata={
+            **request_metadata,
             "chunk_index": i,
             "chunk_count": len(chunk_idx_groups),
         })
         if not fully_accepted:
-            info(f"chunk {i + 1}/{len(chunk_idx_groups)} failed to deliver ({len(chunk)} events)")
+            info(f"chunk {i + 1}/{len(chunk_idx_groups)} failed to deliver ({len(chunk)} spans)")
         for j in idx_group:
-            t = event_turn_idx[j]
+            t = span_turn_idx[j]
             turn_ok[t] = turn_ok.get(t, True) and fully_accepted
 
     return {t for t, ok in turn_ok.items() if ok}

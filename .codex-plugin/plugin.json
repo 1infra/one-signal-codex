@@ -1,6 +1,6 @@
 {
   "name": "one-signal-codex",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "Trace OpenAI Codex CLI sessions to your One Infra organization via One Connector.",
   "author": {
     "name": "One Infra",
@@ -13,7 +13,7 @@
   "interface": {
     "displayName": "One Signal (Codex)",
     "shortDescription": "Trace Codex CLI sessions to your One Infra org",
-    "longDescription": "Uploads each completed OpenAI Codex CLI turn — model generations, tool calls, reasoning summaries, and token usage/cost — to your One Infra organization via One Connector, so Codex sessions render as Langfuse traces alongside your Claude Code sessions. No Langfuse credentials live on the developer's machine; only a One Connector access token.",
+    "longDescription": "Uploads each completed OpenAI Codex CLI turn — model generations, tool calls, reasoning summaries, and token usage/cost — to your One Infra organization via One Connector, so Codex sessions render in Console Observe alongside your Claude Code sessions. Only a One Connector access token lives on the developer's machine.",
     "developerName": "One Infra",
     "category": "Coding",
     "capabilities": ["Read"],

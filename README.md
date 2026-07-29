@@ -1,8 +1,8 @@
 # One Signal for Codex CLI
 
 Trace every Codex CLI turn — model generations, tool calls, and token
-usage/cost — to your **One Infra** organization, with zero Langfuse
-credentials on your machine. This is the Codex CLI counterpart of
+usage/cost — to your **One Infra** organization using a One Connector
+access token. This is the Codex CLI counterpart of
 [`one-signal-claude-code`](https://github.com/1infra/one-signal-claude-code)
 (the Claude Code plugin): same
 destination, same wire format, same One Connector access-token transport —
@@ -67,8 +67,8 @@ first, then `~/.codex/one-signal.json`.**
 | Setting | Env var | JSON key | Description |
 | --- | --- | --- | --- |
 | API token | `ONE_SIGNAL_API_TOKEN` | `ONE_SIGNAL_API_TOKEN` | Your One Connector access token (`oc_...`). Required. |
-| Base URL | `ONE_SIGNAL_BASE_URL` | `ONE_SIGNAL_BASE_URL` | Your One Connector deployment. Default `https://connector.1infra.io`. The hook POSTs to `<this>/api/v1/observe/ingest`. |
-| User ID | `ONE_SIGNAL_USER_ID` | `ONE_SIGNAL_USER_ID` | Optional. User identifier attached to every trace. |
+| Base URL | `ONE_SIGNAL_BASE_URL` | `ONE_SIGNAL_BASE_URL` | Your One Connector deployment. Default `https://connector.1infra.io`. The hook POSTs to `<this>/api/public/otel/v1/traces`. |
+| User ID | `ONE_SIGNAL_USER_ID` | `ONE_SIGNAL_USER_ID` | Optional self-reported metadata emitted as `one.signal.configured_user_id`. It is not an authentication identity; One Infra derives the authenticated actor from the access token. |
 | Debug logging | `ONE_SIGNAL_CODEX_DEBUG=1` | — | Verbose logging to `~/.codex/one-signal-hook.log`. |
 | Truncation | `ONE_SIGNAL_CODEX_MAX_CHARS` | — | Truncate captured inputs/outputs to this many characters. Default `20000`. |
 | Instruction documents | `ONE_SIGNAL_CODEX_INSTRUCTION_DOCUMENTS` | — | Upload active global and project `AGENTS.md` snapshots for Intelligence compliance analysis. Default `true`. |
@@ -99,12 +99,15 @@ The plugin's `Stop` hook (`hooks/hooks.json`) runs
 pipes a JSON payload to the hook's **stdin** carrying `session_id` and
 `transcript_path` (the rollout file). The hook parses that rollout JSONL
 incrementally (tracking a byte-offset cursor so re-runs only process new
-turns) and builds one Langfuse trace per completed turn: a root span
+turns) and builds one trace per completed turn: a root span
 ("Turn N"), one generation per model round-trip (with token usage when
 available), tool-call spans nested under their generation, and reasoning
-captured as a lightweight event. The batch is POSTed to
-`<ONE_SIGNAL_BASE_URL>/api/v1/observe/ingest`, identically to the Claude
-Code plugin.
+captured as a lightweight event. The internal events are converted to
+OTLP/JSON and POSTed to
+`<ONE_SIGNAL_BASE_URL>/api/public/otel/v1/traces` with HTTP Basic
+authentication using the access token as the username and an empty
+password. Requests contain at most 200 spans and 3.5 MB of final serialized
+JSON.
 
 Each turn is also attributed, matching the Claude Code plugin's tags so both
 sources filter alike in Console → Observe: skills invoked in the turn
@@ -132,8 +135,8 @@ neither. State (byte offset + turn count per session) lives under
 ## Reliability notes
 
 - **Incremental checkpoint:** the byte-offset cursor only advances past
-  turns whose events were fully accepted upstream (every HTTP chunk 2xx, any
-  207's per-event `errors` empty) *and* that were completely parsed (a turn
+  turns whose spans were fully accepted upstream (every HTTP request
+  returned 2xx) *and* that were completely parsed (a turn
   with no `task_complete` seen yet is left for the next run). Deterministic
   trace/observation IDs (`<thread_id>-t<turn_number>`) make retries
   idempotent upserts, not duplicates.
@@ -145,10 +148,6 @@ neither. State (byte offset + turn count per session) lives under
 - **Transient delivery failures:** network errors, HTTP 429, and HTTP 5xx are
   retried up to three times inside the same Hook run. The checkpoint advances
   only after every event for a completed turn is accepted upstream.
-- If your organization hasn't connected Langfuse yet, the proxy responds
-  `503 signal_not_configured`; the hook logs a hint and exits cleanly
-  without advancing the checkpoint, so it retries automatically once Langfuse
-  is connected.
 - `fcntl`-based locking doesn't exist on Windows; the hook proceeds without
   cross-process locking there (best-effort only).
 
@@ -156,8 +155,7 @@ neither. State (byte offset + turn count per session) lives under
 
 This sends your Codex CLI turn data (prompts, assistant output, tool calls,
 token usage) to `ONE_SIGNAL_BASE_URL`, authenticated with your One Connector
-access token, which forwards it into your organization's own Langfuse
-project. Reasoning items' encrypted content blob (`encrypted_content`) is
+access token. Reasoning items' encrypted content blob (`encrypted_content`) is
 never read or transmitted — only the optional plaintext summary (present only
 if your Codex reasoning-summary setting is enabled) is captured, truncated
 via `ONE_SIGNAL_CODEX_MAX_CHARS`.
@@ -176,8 +174,8 @@ via `ONE_SIGNAL_CODEX_MAX_CHARS`.
 - **`403 token_inactive` / `401`:** the token in `~/.codex/one-signal.json`
   (or `ONE_SIGNAL_API_TOKEN`) is invalid or inactive — regenerate it in
   Console → Access tokens.
-- **`503 signal_not_configured`:** your organization hasn't connected
-  Langfuse yet — do that in Console → Integrations.
+- **Other HTTP 4xx responses:** the request remains queued for a later hook
+  run; check the debug log for the permanent rejection status.
 
 ## Self-test
 

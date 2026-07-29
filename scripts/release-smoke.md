@@ -15,8 +15,7 @@ before (real exec-mode rollouts vs synthetic fixtures).
 1. Codex CLI ≥ 0.144 with the `hooks` feature stable/enabled.
 2. Plugin installed and enabled (`one-signal-codex@one-infra`).
 3. `~/.codex/one-signal.json` (or `ONE_SIGNAL_API_TOKEN`) points at a real
-   org with Langfuse connected (otherwise ingest returns
-   `503 signal_not_configured`).
+   org with OTLP ingest access.
 4. `codex` on `PATH` (override with `CODEX_BIN`).
 5. Browser access to Console → Observe for the same org (verification uses
    **session cookies**, not the plugin `oc_` token).
